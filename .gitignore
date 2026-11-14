@@ -1,0 +1,59 @@
+# Only publish the source directories and files listed below.
+# Keep new top-level files private until explicitly included here.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/requirements.txt
+!/core/
+!/models/
+!/engine/
+!/tokenizers/
+!/configs/
+!/dataset/
+!/scripts/
+
+# Keep only source code and public configurations in these directories.
+/core/*
+!/core/*.py
+!/core/*.cu
+/models/*
+!/models/*.py
+/engine/*
+!/engine/*.py
+/tokenizers/*
+!/tokenizers/*.py
+/configs/*
+!/configs/pretrain.json
+!/configs/sft.json
+
+# Data loaders only; private corpus and API generation tools stay local.
+/dataset/*
+!/dataset/__init__.py
+!/dataset/language_model_loader.py
+!/dataset/token_cache.py
+
+# Daily training and inference entry points.
+/scripts/*
+!/scripts/__init__.py
+!/scripts/train_tokenizer.py
+!/scripts/train_transformer.py
+!/scripts/train_sft.py
+!/scripts/generate_transformer.py
+!/scripts/plot_training.py
+
+# Tests stay local.
+/tests/
+
+# Never include local caches, credentials, datasets or weights.
+__pycache__/
+*.py[cod]
+.env
+.env.*
+*.pem
+*.key
+*.npy
+*.npz
+*.parquet
+*.safetensors
+*.log

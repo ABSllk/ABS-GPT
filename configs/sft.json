@@ -1,0 +1,34 @@
+{
+  "stage": "sft",
+  "base_run": null,
+  "base_checkpoint": "best",
+  "seed": 42,
+  "context_size": null,
+  "batch_size": 4,
+  "micro_batch_size": null,
+  "planned_steps": 1000,
+  "eval_interval": 100,
+  "optimizer": {
+    "lr": null,
+    "weight_decay": 0.0
+  },
+  "lora": {
+    "enabled": false,
+    "config": {
+      "rank": 16,
+      "alpha": 32,
+      "target_modules": ["W_q", "W_k", "W_v", "output", "gate_linear", "down_linear", "up_linear"],
+      "module_prefix": "transformer_blocks"
+    }
+  },
+  "warmup_steps": 0,
+  "lr_cooldown": null,
+  "data": {
+    "train": {
+      "path": null
+    },
+    "eval": {
+      "path": null
+    }
+  }
+}
