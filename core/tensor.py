@@ -178,6 +178,37 @@ class Tensor:
         out._set_backward(_backward)
         return out
 
+    def minimum(self, axis=None, keepdims=False):
+        out = Tensor(
+            xp.minimum(self.data, other.data),
+            require_grad=self.require_grad or other.require_grad,
+            pre=(self, other),
+            opr="minimum",
+        )
+
+        def _backward():
+            equal = (self.data == other.data).astype(FLOAT_DTYPE) * 0.5
+            if self.require_grad:
+                weight = (self.data < other.data).astype(FLOAT_DTYPE) + equal
+                self.grad += unbroadcast(out.grad * weight, self.grad.shape)
+            if other.require_grad:
+                weight = (self.data > other.data).astype(FLOAT_DTYPE) + equal
+                other.grad += unbroadcast(out.grad * weight, other.grad.shape)
+
+        out._set_backward(_backward)
+        return out
+
+    def clip(self, min_value, max_value):
+        out = Tensor(xp.clip(self.data, min_value, max_value), require_grad=self.require_grad, pre=(self,), opr="clip")
+
+        def _backward():
+            if self.require_grad:
+                mask = (self.data >= min_value) & (self.data <= max_value)
+                self.grad += out.grad * mask
+
+        out._set_backward(_backward)
+        return out
+
     def __getitem__(self, index):
         out = Tensor(self.data[index], require_grad=self.require_grad, pre=(self,), opr="getitem")
         
