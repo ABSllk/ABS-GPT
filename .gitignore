@@ -26,6 +26,7 @@
 /configs/*
 !/configs/pretrain.json
 !/configs/sft.json
+!/configs/grpo.json
 
 # Data loaders only; private corpus and API generation tools stay local.
 /dataset/*
@@ -39,6 +40,7 @@
 !/scripts/train_tokenizer.py
 !/scripts/train_transformer.py
 !/scripts/train_sft.py
+!/scripts/train_grpo.py
 !/scripts/generate_transformer.py
 !/scripts/plot_training.py
 

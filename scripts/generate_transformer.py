@@ -59,10 +59,11 @@ def main():
                 break
         else:
             prompt = args.prompt
-        encoded_prompt = render_prompt(prompt) if manifest.get("stage") == "sft" else prompt
+        instruction = manifest.get("stage") in ("sft", "grpo")
+        encoded_prompt = render_prompt(prompt) if instruction else prompt
         start_tokens = [tokenizer.bos_id, *tokenizer.encode(encoded_prompt)]
         generator = Generator(model=model, context_size=context_size, seed=args.seed)
-        generated_tokens = generator.generate(
+        result = generator.generate(
             start_tokens=start_tokens,
             end_token=tokenizer.eos_id,
             max_new_tokens=args.max_new_tokens,
@@ -70,8 +71,8 @@ def main():
             do_sample=not args.greedy,
             top_p=args.top_p,
         )
-        generated_text = tokenizer.decode(generated_tokens, errors="replace")
-        print(generated_text if manifest.get("stage") == "sft" else prompt + generated_text, flush=True)
+        generated_text = tokenizer.decode(result["token_ids"], errors="replace")
+        print(generated_text if instruction else prompt + generated_text, flush=True)
         if args.prompt is not None:
             break
 

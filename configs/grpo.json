@@ -1,0 +1,45 @@
+{
+  "stage": "grpo",
+  "monitor": "eval_reward",
+  "monitor_mode": "max",
+  "base_run": null,
+  "base_checkpoint": "best",
+  "seed": 42,
+  "context_size": 512,
+  "batch_size": 1,
+  "group_size": 4,
+  "max_new_tokens": 128,
+  "micro_batch_size": 1,
+  "max_grad_norm": 1.0,
+  "epsilon": 0.2,
+  "beta": 0.01,
+  "reward_fn": "engine.rewards:poetry_reward",
+  "eval_samples": 8,
+  "planned_steps": 1000,
+  "eval_interval": 100,
+  "log_interval": 10,
+  "optimizer": {
+    "lr": 0.00001,
+    "weight_decay": 0.0
+  },
+  "warmup_steps": 20,
+  "lr_cooldown": {
+    "start_step": 20,
+    "steps": 980,
+    "shape": "cosine",
+    "min_lr_ratio": 0.2
+  },
+  "lora": {
+    "enabled": true,
+    "config": {
+      "rank": 16,
+      "alpha": 32,
+      "target_modules": ["W_q", "W_k", "W_v", "output", "gate_linear", "down_linear", "up_linear"],
+      "module_prefix": "transformer_blocks"
+    }
+  },
+  "data": {
+    "train": {"path": "data/literature/sft_all_structured_20261114/train.parquet"},
+    "eval": {"path": "data/literature/sft_all_structured_20261114/eval.parquet"}
+  }
+}
