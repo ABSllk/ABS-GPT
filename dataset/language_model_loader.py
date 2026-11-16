@@ -73,15 +73,61 @@ class TokenDocuments:
             "loss_mask": np.ones(end - start - 1, dtype=bool)
         }
 
-class LanguageModelLoader:
+class BaseLoader:
+    def __init__(self, size, batch_size, seed=42):
+        self.num_samples = size
+        self.batch_size = batch_size
+        self.rng = np.random.default_rng(seed)
+        self.epoch = 0
+        self._start_epoch()
+
+    def _make_units(self, order):
+        return order
+
+    def _start_epoch(self):
+        self.order = self.rng.permutation(self.num_samples)
+        self.units = self._make_units(self.order)
+        self.cursor = 0
+        self.epoch += 1
+
+    def next_batch(self):
+        if self.cursor >= len(self.units):
+            self._start_epoch()
+        selected = self.units[self.cursor:self.cursor + self.batch_size]
+        self.cursor += len(selected)
+        return self._collate(selected)
+
+    def state_dict(self):
+        return {"epoch": self.epoch, "cursor": self.cursor, "order": self.order.tolist(),
+                "rng_state": self.rng.bit_generator.state}
+
+    def load_state_dict(self, state):
+        self.epoch = state["epoch"]
+        self.cursor = state["cursor"]
+        self.order = np.asarray(state["order"], dtype=np.int64)
+        self.rng.bit_generator.state = state["rng_state"]
+        self.units = self._make_units(self.order)
+
+    def __next__(self):
+        return self.next_batch()
+
+
+class PromptLoader(BaseLoader):
+    def __init__(self, rows, batch_size, seed=42):
+        self.rows = rows
+        super().__init__(len(rows), batch_size, seed)
+
+    def _collate(self, indices):
+        return [self.rows[int(index)] for index in indices]
+
+
+class LanguageModelLoader(BaseLoader):
     def __init__(self, dataset, tokenizer, context_size, batch_size, max_length=None, seed=42, *, packing="stream", isolate_samples=False):
         self.dataset = dataset
-        self.batch_size = batch_size
         self.context_size = context_size
         self.tokenizer = tokenizer
         self.packing = packing
         self.isolate_samples = isolate_samples
-        self.rng = np.random.default_rng(seed)
         if isinstance(dataset, (str, Path)):
             self.token_ids = load_text_tokens(dataset, tokenizer, max_length)
             if packing == "stream":
@@ -104,8 +150,7 @@ class LanguageModelLoader:
             if np.any(self.lengths <= 0) or np.any(self.lengths > context_size):
                 raise ValueError("Examples must fit the context size; split long documents before packing")
             self.num_samples = len(dataset)
-        self.epoch = 0
-        self._start_epoch()
+        super().__init__(self.num_samples, batch_size, seed)
 
     def _make_packs(self, order):
         packs = []
@@ -130,12 +175,11 @@ class LanguageModelLoader:
                 available |= 1 << remaining
         return packs
 
-    def _start_epoch(self):
-        self.order = self.rng.permutation(self.num_samples)
-        self.epoch += 1
+    def _make_units(self, order):
         if self.packing == "documents":
-            self.packs = self._make_packs(self.order)
-        self.cursor = 0
+            self.packs = self._make_packs(order)
+            return self.packs
+        return order
 
     def _stream_batch(self, sample_ids):
         positions = sample_ids[:, None] * self.context_size + np.arange(self.context_size)
@@ -143,6 +187,8 @@ class LanguageModelLoader:
                 "targets": np.asarray(self.token_ids[positions + 1], dtype=np.int64)}
 
     def _collate(self, packs):
+        if self.packing == "stream":
+            return self._stream_batch(packs)
         shape = (len(packs), self.context_size)
         batch = {"inputs": np.full(shape, self.tokenizer.pad_id, dtype=np.int64),
                  "targets": np.full(shape, self.tokenizer.pad_id, dtype=np.int64),
@@ -162,37 +208,12 @@ class LanguageModelLoader:
                 offset = end
         return batch
 
-    def next_batch(self):
-        units = self.order if self.packing == "stream" else self.packs
-        if self.cursor >= len(units):
-            self._start_epoch()
-            units = self.order if self.packing == "stream" else self.packs
-        selected = units[self.cursor:self.cursor + self.batch_size]
-        self.cursor += len(selected)
-        return self._stream_batch(selected) if self.packing == "stream" else self._collate(selected)
-
     def iter_eval_batches(self):
         order = np.arange(self.num_samples)
         units = order if self.packing == "stream" else self._make_packs(order)
         for start in range(0, len(units), self.batch_size):
             selected = units[start:start + self.batch_size]
             yield self._stream_batch(selected) if self.packing == "stream" else self._collate(selected)
-
-    def state_dict(self):
-        return {"epoch": self.epoch, "cursor": self.cursor, "order": self.order.tolist(),
-                "rng_state": self.rng.bit_generator.state}
-
-    def load_state_dict(self, state):
-        self.epoch = state["epoch"]
-        self.cursor = state["cursor"]
-        self.order = np.asarray(state["order"], dtype=np.int64)
-        self.rng.bit_generator.state = state["rng_state"]
-        if self.packing == "documents":
-            self.packs = self._make_packs(self.order)
-
-    def __next__(self):
-        return self.next_batch()
-
 
 class BucketedSFTLoader:
     """Pack complete examples by length; visit every pack once per epoch."""
@@ -253,3 +274,9 @@ def load_sft_data(path, tokenizer, context_size, batch_size, seed=42, context_bu
         return BucketedSFTLoader(examples, tokenizer, contexts, batch_size, seed)
     return LanguageModelLoader(examples, tokenizer, context_size, batch_size, seed=seed,
                                packing="documents", isolate_samples=True)
+
+
+def load_prompt_data(path, tokenizer, context_size, max_new_tokens):
+    rows = pq.read_table(path).to_pylist()
+    budget = context_size - max_new_tokens - 1
+    return [row for row in rows if len(tokenizer.encode(render_prompt(row["prompt"]))) <= budget]

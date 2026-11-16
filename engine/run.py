@@ -52,21 +52,35 @@ class TrainingRun:
         self.last_validation_step = -1
 
     @classmethod
-    def sft(cls, args, base):
-        config = args.settings
-        config["model"] = base["model"]
-        config["activation_checkpointing"] = base.get("activation_checkpointing")
-        config["base_run"] = str((ROOT / config["base_run"]).resolve())
-        config["context_size"] = config["context_size"] or base["model"]["context_size"]
-        if not config["lora"]["enabled"]:
-            config["lora"] = None
-        if config["optimizer"]["lr"] is None:
-            config["optimizer"]["lr"] = 1e-4 if config["lora"] else 1e-5
-        config["prompt_template"] = render_prompt("{prompt}")
-        for data in config["data"].values():
-            path = (ROOT / data["path"]).resolve()
-            data.update(path=str(path), sha256=sha256_bytes(path.read_bytes()))
-        return cls(args.run_dir, config)
+    def finetune(cls, args):
+        if args.resume:
+            model, tokenizer, config = load_run(args.run_dir, "last")
+        else:
+            config = args.settings
+            model, tokenizer, base = load_run(ROOT / config["base_run"], config["base_checkpoint"])
+            config["model"] = base["model"]
+            config["activation_checkpointing"] = base.get("activation_checkpointing")
+            config["base_run"] = str((ROOT / config["base_run"]).resolve())
+            config["context_size"] = config["context_size"] or base["model"]["context_size"]
+            if base.get("lora") is not None:
+                config["lora"] = base["lora"]
+            elif not config["lora"]["enabled"]:
+                config["lora"] = None
+            if config["optimizer"]["lr"] is None:
+                config["optimizer"]["lr"] = 1e-4 if config["lora"] else 1e-5
+            config["prompt_template"] = render_prompt("{prompt}")
+            for data in config["data"].values():
+                path = (ROOT / data["path"]).resolve()
+                data.update(path=str(path), sha256=sha256_bytes(path.read_bytes()))
+
+        if args.steps is not None:
+            config["planned_steps"] = args.steps
+        np.random.seed(config["seed"])
+        xp.random.seed(config["seed"])
+        if not args.resume and base.get("lora") is None and config["lora"] is not None:
+            report = inject_lora(model, LoRAConfig(**config["lora"]["config"]))
+            config["lora"]["target_paths"] = report["target_paths"]
+        return cls(args.run_dir, config, resume=args.resume), model, tokenizer
 
     @classmethod
     def transformer(cls, args, clock=time.perf_counter):

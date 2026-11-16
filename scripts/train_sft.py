@@ -3,14 +3,10 @@
 import argparse
 from pathlib import Path
 
-import numpy as np
-
-from core.backend import xp
-from core.lora import LoRAConfig, inject_lora
 from core.nn import CrossEntropyLoss
 from core.optimizer import AdamW
 from dataset.language_model_loader import load_sft_data
-from engine.run import ROOT, TrainingRun, load_run, parse_config
+from engine.run import TrainingRun, parse_config
 from engine.trainer import LanguageModelTrainer
 
 
@@ -39,28 +35,8 @@ def main(argv=None, *, validation_callback=None):
     parser.add_argument("--eval-interval", dest="settings.eval_interval", type=int)
     parser.add_argument("--seed", dest="settings.seed", type=int)
     args = parse_config(parser, "sft.json", argv)
-    if args.resume:
-        model, tokenizer, config = load_run(args.run_dir, "last")
-        run = TrainingRun(args.run_dir, config, resume=True)
-    else:
-        model, tokenizer, base = load_run(ROOT / args.settings["base_run"], args.settings["base_checkpoint"])
-        run = TrainingRun.sft(args, base)
+    run, model, tokenizer = TrainingRun.finetune(args)
     config = run.config
-    if args.steps is not None:
-        config["planned_steps"] = args.steps
-
-    np.random.seed(config["seed"])
-    xp.random.seed(config["seed"])
-    if not args.resume:
-        if base.get("lora") is not None:
-            if config.get("lora") is None or base["lora"]["config"] != config["lora"]["config"]:
-                raise ValueError("Continuing a LoRA run requires the same LoRA configuration")
-            config["lora"]["target_paths"] = base["lora"]["target_paths"]
-            print("Continuing loaded LoRA weights with a new optimizer and data loader", flush=True)
-        elif config.get("lora") is not None:
-            report = inject_lora(model, LoRAConfig(**config["lora"]["config"]))
-            config["lora"]["target_paths"] = report["target_paths"]
-            print(f"LoRA parameters: {report['trainable_parameters']:,} / {report['total_parameters']:,}", flush=True)
 
     loaders = {}
     for split, data in config["data"].items():

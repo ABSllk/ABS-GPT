@@ -12,6 +12,7 @@ class Generator:
     def generate(self, start_tokens, end_token, max_new_tokens=20, temperature=1.0, do_sample=True, top_p=1.0):
         tokens = list(start_tokens)
         generated = []
+        finish_reason = "length"
         cache = [{} for _ in self.model.transformer_blocks]
 
         with Tensor.no_grad():
@@ -45,10 +46,13 @@ class Generator:
                 else:
                     next_token = int(xp.argmax(logits.data[0]).item())
 
-                if next_token == end_token:
-                    break
-
                 generated.append(next_token)
                 tokens.append(next_token)
+                if next_token == end_token:
+                    finish_reason = "eos"
+                    break
 
-        return generated
+        return {
+            "token_ids": generated,
+            "finish_reason": finish_reason,
+        }
