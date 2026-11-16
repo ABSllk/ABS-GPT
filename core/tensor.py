@@ -178,7 +178,8 @@ class Tensor:
         out._set_backward(_backward)
         return out
 
-    def minimum(self, axis=None, keepdims=False):
+    def minimum(self, other):
+        other = self._as_tensor(other)
         out = Tensor(
             xp.minimum(self.data, other.data),
             require_grad=self.require_grad or other.require_grad,
