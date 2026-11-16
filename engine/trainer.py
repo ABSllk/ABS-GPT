@@ -85,21 +85,40 @@ def mtp_loss_masks(shape, depth_count, loss_mask=None, token_mask=None, document
     return masks
 
 
-class Trainer:
-    def __init__(self, model, optimizer, loss_fn, max_grad_norm=1.0, micro_batch_size=None, scheduler=None):
+class BaseTrainer:
+    def __init__(self, model, optimizer, max_grad_norm=1.0, micro_batch_size=None, scheduler=None):
         self.model = model
         self.optimizers = list(optimizer) if isinstance(optimizer, (list, tuple)) else [optimizer]
         self.parameters = [p for item in self.optimizers for p in item.parameters]
-        self.loss_fn = loss_fn
         self.max_grad_norm = max_grad_norm
         self.micro_batch_size = micro_batch_size
         self.scheduler = scheduler
 
-    def fit(self, train_loader, eval_loader, steps, eval_interval, run, return_mtp=False, validation_callback=None):
+    def zero_grad(self):
+        for optimizer in self.optimizers:
+            optimizer.zero_grad()
+
+    def step_optimizers(self, step):
+        total_norm = 0.0
+        for parameter in self.parameters:
+            if parameter.grad is not None:
+                total_norm += xp.linalg.norm(parameter.grad) ** 2
+        total_norm = xp.sqrt(total_norm)
+        self.last_grad_norm = float(total_norm.item())
+        if self.max_grad_norm is not None and total_norm > self.max_grad_norm:
+            scale = self.max_grad_norm / (total_norm + 1e-6)
+            for parameter in self.parameters:
+                if parameter.grad is not None:
+                    parameter.grad *= scale
+        if self.scheduler is not None:
+            self.scheduler.step(step)
+        for optimizer in self.optimizers:
+            optimizer.step()
+
+    def fit(self, train_loader, eval_loader, steps, eval_interval, run, validation_callback=None):
         def validate():
             run.release_cache()
-            metrics = (eval_loader.evaluate(self.model) if run.pretraining
-                       else {"val_loss": self.evaluate(eval_loader)})
+            metrics = self.evaluate(eval_loader)
             run.save(self.model, self.optimizers, train_loader, metrics)
             return bool(validation_callback(run.state["completed_steps"], metrics, self.model)) if validation_callback else False
 
@@ -114,8 +133,11 @@ class Trainer:
                 stop_reason = "time_budget"
                 break
             batch = run.next_batch(train_loader, step)
-            loss = self.train_step(**batch, return_mtp=return_mtp, step=step)
-            run.log_train(step, loss, self, train_loader, batch)
+            metrics = self.train_step(batch, step=step)
+            metrics["learning_rate"] = self.optimizers[0].param_groups[0]["lr"]
+            for optimizer in self.optimizers[1:]:
+                metrics[f"{type(optimizer).__name__.lower()}_learning_rate"] = optimizer.param_groups[0]["lr"]
+            run.log_train(step, metrics, train_loader)
             if step % eval_interval == 0 or step == steps or step in run.eval_at:
                 if validate():
                     stop_reason = "validation_guard"
@@ -124,9 +146,20 @@ class Trainer:
             validate()
         run.finish(stop_reason)
 
-    def train_step(self, inputs, targets, return_mtp=False, loss_mask=None, token_mask=None, segment_ids=None, document_ids=None, step=None):
-        for optimizer in self.optimizers:
-            optimizer.zero_grad()
+
+class LanguageModelTrainer(BaseTrainer):
+    def __init__(self, model, optimizer, loss_fn, max_grad_norm=1.0, micro_batch_size=None, scheduler=None,
+                 return_mtp=False):
+        super().__init__(model, optimizer, max_grad_norm, micro_batch_size, scheduler)
+        self.loss_fn = loss_fn
+        self.return_mtp = return_mtp
+
+    def train_step(self, batch, step=None):
+        inputs, targets = batch["inputs"], batch["targets"]
+        loss_mask, token_mask = batch.get("loss_mask"), batch.get("token_mask")
+        segment_ids, document_ids = batch.get("segment_ids"), batch.get("document_ids")
+        return_mtp = self.return_mtp
+        self.zero_grad()
         batch_size = len(inputs)
         micro = self.micro_batch_size or batch_size
         total = ntp_total = mtp_total = aux_total = 0.0
@@ -185,24 +218,24 @@ class Trainer:
         if use_moe:
             self.last_ntp_loss, self.last_mtp_loss, self.last_moe_aux_loss = ntp_total, mtp_total, aux_total
             self.last_expert_counts = counts_total
-        if self.max_grad_norm is not None:
-            total_norm = 0.0
-            for p in self.parameters:
-                if p.grad is not None:
-                    total_norm += xp.linalg.norm(p.grad) ** 2
-            total_norm = xp.sqrt(total_norm)
-            self.last_grad_norm = float(total_norm.item())
-            if total_norm > self.max_grad_norm:
-                scale = self.max_grad_norm / (total_norm + 1e-6)
-                for p in self.parameters:
-                    if p.grad is not None:
-                        p.grad *= scale
-        if self.scheduler is not None:
-            self.scheduler.step(step)
-
-        for optimizer in self.optimizers:
-            optimizer.step()
-        return total
+        self.step_optimizers(step)
+        metrics = {
+            "train_loss": total,
+            "tokens": int(loss_mask.sum()) if loss_mask is not None else targets.size,
+            "grad_norm": self.last_grad_norm,
+            "context_size": inputs.shape[1],
+            "batch_size": batch_size,
+        }
+        if use_moe:
+            metrics.update(ntp_loss=ntp_total, mtp_loss=mtp_total, moe_aux_loss=aux_total)
+            fractions = counts_total / counts_total.sum(axis=1, keepdims=True)
+            metrics["routing"] = {
+                "min_expert_fraction": float(fractions.min()),
+                "max_expert_fraction": float(fractions.max()),
+                "empty_experts": int((counts_total == 0).sum()),
+                "expert_counts": counts_total.tolist(),
+            }
+        return metrics
 
     def _forward_loss(self, inputs, targets, return_mtp, loss_mask, token_mask, segment_ids, document_ids, mtp_masks, mtp_weights, ntp_weight, aux_weight):
         use_moe = getattr(self.model, "use_moe", False)
@@ -234,6 +267,8 @@ class Trainer:
         return loss
 
     def evaluate(self, loader, steps=None):
+        if isinstance(loader, FixedValidation):
+            return loader.evaluate(self.model)
         total_loss = 0.0
         total_tokens = 0
         batches = (loader.iter_eval_batches() if steps is None
@@ -250,5 +285,5 @@ class Trainer:
                 loss = self.loss_fn(logits, batch["targets"], mask)
                 total_loss += float(loss.data.item()) * count
                 total_tokens += count
-        return total_loss / total_tokens
+        return {"val_loss": total_loss / total_tokens}
 

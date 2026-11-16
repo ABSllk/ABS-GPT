@@ -11,7 +11,7 @@ from core.nn import CrossEntropyLoss
 from core.optimizer import Optimizer
 from dataset.language_model_loader import LanguageModelLoader
 from engine.run import ROOT, TrainingRun, parse_config
-from engine.trainer import FixedValidation, Trainer
+from engine.trainer import FixedValidation, LanguageModelTrainer
 from models.transformer_language_model import TransformerLanguageModel
 from tokenizers.bpe_tokenizer import BPETokenizer
 
@@ -105,13 +105,14 @@ def main(validation_callback=None, argv=None):
         name=manifest.get("optimizer_name")
     )
     run.start(model, optimizers, train_loader, tokenizer)
-    trainer = Trainer(
+    trainer = LanguageModelTrainer(
         model, 
         optimizers, 
         CrossEntropyLoss(), 
         manifest["max_grad_norm"], 
         micro_batch_size=manifest.get("micro_batch_size"), 
-        scheduler=run.scheduler(optimizers, args)
+        scheduler=run.scheduler(optimizers, args),
+        return_mtp=model.use_mtp,
     )
     trainer.fit(
         train_loader, 
@@ -119,7 +120,6 @@ def main(validation_callback=None, argv=None):
         manifest["planned_steps"], 
         manifest["eval_interval"], 
         run, 
-        return_mtp=model.use_mtp, 
         validation_callback=validation_callback
     )
 

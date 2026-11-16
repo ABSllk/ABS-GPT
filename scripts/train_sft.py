@@ -11,7 +11,7 @@ from core.nn import CrossEntropyLoss
 from core.optimizer import AdamW
 from dataset.language_model_loader import load_sft_data
 from engine.run import ROOT, TrainingRun, load_run, parse_config
-from engine.trainer import Trainer
+from engine.trainer import LanguageModelTrainer
 
 
 def main(argv=None, *, validation_callback=None):
@@ -77,7 +77,7 @@ def main(argv=None, *, validation_callback=None):
     optimizer = AdamW(parameters, **config["optimizer"])
     run.start(model, optimizer, loaders["train"], tokenizer)
 
-    trainer = Trainer(
+    trainer = LanguageModelTrainer(
         model, 
         optimizer, 
         CrossEntropyLoss(), 

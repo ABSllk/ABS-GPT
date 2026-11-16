@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from core.backend import DEVICE, xp, to_cpu
+from core.backend import DEVICE, xp
 from core.lora import LoRAConfig, inject_lora
 from dataset.language_model_loader import render_prompt
 from engine.checkpoint import Checkpoint
@@ -37,10 +37,13 @@ def parse_config(parser, filename, argv=None):
 class TrainingRun:
     def __init__(self, path, config, resume=False, clock=time.perf_counter):
         self.path, self.config, self.resume = Path(path).resolve(), config, resume
-        self.pretraining = config.get("stage") != "sft"
+        self.stage = config.get("stage", "pretrain")
+        self.monitor = config.setdefault("monitor", "val_loss")
+        self.monitor_mode = config.setdefault("monitor_mode", "min")
         self.state = dict(
-            completed_steps=0, tokens_seen=0, best_step=0, best_val_loss=float("inf"),
-            last_val_loss=None, train_seconds=0.0, wall_seconds=0.0,
+            completed_steps=0, tokens_seen=0, best_step=0,
+            best_metric=float("inf") if self.monitor_mode == "min" else -float("inf"),
+            last_metrics={}, train_seconds=0.0, wall_seconds=0.0,
             peak_pool_used_mib=None, train_tokens_per_second=None, stop_reason=None,
         )
         self.previous_wall = 0.0
@@ -117,14 +120,16 @@ class TrainingRun:
             state = Checkpoint.load_training_state(self.path / "last.npz", model, optimizer, loader)
             progress = state["metadata"]
             self.state.update((key, progress[key]) for key in self.state.keys() & progress.keys())
-            self.state["completed_steps"], self.state["best_val_loss"] = state["step"] + 1, state["best_loss"]
+            self.state["completed_steps"], self.state["best_metric"] = state["step"] + 1, state["best_loss"]
             self.previous_wall = self.state["wall_seconds"]
             for name in ("train.csv", "validation.csv", "routing.csv"):
                 truncate_csv(self.path / name, self.state["completed_steps"])
             self.last_validation_step = self.state["completed_steps"]
-            self.state["last_val_loss"] = float(read_csv(self.path / "validation.csv")[-1]["val_loss"])
-        elif not self.pretraining:
-            self.path.mkdir(parents=True)
+            self.state["last_metrics"] = {
+                self.monitor: float(read_csv(self.path / "validation.csv")[-1][self.monitor])
+            }
+        else:
+            self.path.mkdir(parents=True, exist_ok=True)
             tokenizer.save(self.path / "tokenizer.json")
         if not self.resume:
             self.config["artifact_sha256"] = {p.name: sha256_bytes(p.read_bytes()) for p in self.path.glob("*.json")}
@@ -157,7 +162,7 @@ class TrainingRun:
         state = self.state
         synchronize()
         self.session_start = self.clock()
-        if self.pretraining:
+        if self.stage == "pretrain":
             state["peak_pool_used_mib"] = max(state["peak_pool_used_mib"] or 0, pool_used_mib() or 0)
             if not self.resume:
                 Checkpoint.save_model(self.path / "initial.npz", model)
@@ -174,75 +179,62 @@ class TrainingRun:
             xp.get_default_memory_pool().free_all_blocks()
 
     def next_batch(self, loader, step):
-        if self.pretraining:
-            synchronize()
-            self.step_started = self.clock()
-            self.release_cache()
+        synchronize()
+        self.step_started = self.clock()
+        self.release_cache()
         batch = loader.next_batch()
-        if self.pretraining:
+        if self.stage == "pretrain":
             schedule = self.config.get("context_schedule") or [[1, self.config["model"]["context_size"]]]
             self.context = next(length for start, length in reversed(schedule) if start <= step)
             if self.config["packing"] == "stream":
                 batch = {key: value.reshape(-1, self.context) for key, value in batch.items()}
         return batch
 
-    def log_train(self, step, loss, trainer, loader, batch):
+    def log_train(self, step, metrics, loader):
         state = self.state
+        metrics = dict(metrics)
+        tokens = metrics.pop("tokens")
+        routing = metrics.pop("routing", None)
         state["completed_steps"] = step
-        mask = batch.get("loss_mask")
-        tokens = int(mask.sum()) if mask is not None else batch["targets"].size
         state["tokens_seen"] += tokens
-        lr = trainer.optimizers[0].param_groups[0]["lr"]
-        if not self.pretraining:
-            append_csv(self.path / "train.csv", {
-                "step": step, "epoch": loader.epoch, "supervised_tokens_seen": state["tokens_seen"],
-                "train_loss": loss, "learning_rate": lr,
-            })
-            print(f"Step {step}, epoch={loader.epoch}, train_loss={loss:.4f}, lr={lr:.6g}", flush=True)
-            return
         synchronize()
         duration = self.clock() - self.step_started
         state["train_seconds"] += duration
         used = pool_used_mib()
         state["peak_pool_used_mib"] = max(state["peak_pool_used_mib"] or 0, used) if used is not None else None
         row = {
-            "step": step, "tokens_seen": state["tokens_seen"], "train_loss": loss, "epoch": loader.epoch,
-            "learning_rate": lr, "grad_norm": trainer.last_grad_norm,
+            "step": step, "tokens_seen": state["tokens_seen"],
+            "train_loss": metrics.pop("train_loss"), "epoch": loader.epoch,
+            "learning_rate": metrics.pop("learning_rate"), "grad_norm": metrics.pop("grad_norm"),
         }
-        if len(trainer.optimizers) > 1:
-            row["muon_learning_rate"] = trainer.optimizers[1].param_groups[0]["lr"]
+        for name in list(metrics):
+            if name.endswith("_learning_rate"):
+                row[name] = metrics.pop(name)
         row.update(step_seconds=duration, tokens_per_second=tokens / duration,
                    train_seconds=state["train_seconds"], wall_seconds=self.previous_wall + self.clock() - self.session_start,
                    pool_used_mib=used)
-        if "context_schedule" in self.config:
-            row.update(context_size=self.context, batch_size=batch["inputs"].shape[0])
-        if trainer.model.use_moe:
-            row.update(ntp_loss=trainer.last_ntp_loss, mtp_loss=trainer.last_mtp_loss, moe_aux_loss=trainer.last_moe_aux_loss)
+        row.update(metrics)
         append_csv(self.path / "train.csv", row)
-        if step % self.config["log_interval"] == 0:
-            print(f"Step {step}, Train Loss: {loss:.4f}, Recorded Tokens: {state['tokens_seen']}", flush=True)
-            if trainer.model.use_moe:
-                counts = to_cpu(trainer.last_expert_counts)
-                fractions = counts / counts.sum(axis=1, keepdims=True)
-                append_csv(self.path / "routing.csv", {
-                    "step": step, "min_expert_fraction": float(fractions.min()),
-                    "max_expert_fraction": float(fractions.max()), "empty_experts": int((counts == 0).sum()),
-                    "expert_counts": json.dumps(counts.tolist()),
-                })
+        if step % self.config.get("log_interval", 1) == 0:
+            print(f"Step {step}, train_loss={row['train_loss']:.4f}, tokens={state['tokens_seen']}", flush=True)
+            if routing is not None:
+                routing["expert_counts"] = json.dumps(routing["expert_counts"])
+                append_csv(self.path / "routing.csv", {"step": step, **routing})
 
     def save(self, model, optimizer, loader, metrics):
         state = self.state
-        self.last_validation_step, state["last_val_loss"] = state["completed_steps"], metrics["val_loss"]
-        if state["last_val_loss"] < state["best_val_loss"]:
-            state["best_val_loss"], state["best_step"] = state["last_val_loss"], state["completed_steps"]
+        self.last_validation_step = state["completed_steps"]
+        state["last_metrics"] = dict(metrics)
+        value = metrics[self.monitor]
+        better = value < state["best_metric"] if self.monitor_mode == "min" else value > state["best_metric"]
+        if better:
+            state["best_metric"], state["best_step"] = value, state["completed_steps"]
             Checkpoint.save_model(self.path / "best.npz", model)
         Checkpoint.save_training_state(self.path / "last.npz", model, optimizer, state["completed_steps"] - 1,
-                                       state["best_val_loss"], loader, metadata=self.snapshot())
-        row = {"step": state["completed_steps"]}
-        if self.pretraining:
-            row["tokens_seen"] = state["tokens_seen"]
+                                       state["best_metric"], loader, metadata=self.snapshot())
+        row = {"step": state["completed_steps"], "tokens_seen": state["tokens_seen"]}
         append_csv(self.path / "validation.csv", row | metrics)
-        print(f"Step {state['completed_steps']}, val_loss={state['last_val_loss']:.4f}, best={state['best_val_loss']:.4f}", flush=True)
+        print(f"Step {state['completed_steps']}, {self.monitor}={value:.4f}, best={state['best_metric']:.4f}", flush=True)
 
     def snapshot(self):
         state = self.state
@@ -253,8 +245,7 @@ class TrainingRun:
 
     def finish(self, stop_reason):
         self.state["stop_reason"] = stop_reason
-        if self.pretraining:
-            write_json(self.path / "summary.json", self.snapshot())
+        write_json(self.path / "summary.json", self.snapshot())
 
 
 def load_run(run_dir, checkpoint="best"):
