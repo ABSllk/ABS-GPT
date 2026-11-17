@@ -2,6 +2,7 @@ import math
 import time
 
 import numpy as np
+from cupyx.profiler import time_range
 
 from core.backend import to_cpu, xp
 from core.nn import CrossEntropyLoss
@@ -94,26 +95,29 @@ class BaseTrainer:
         self.micro_batch_size = micro_batch_size
         self.scheduler = scheduler
 
+    @time_range("zero_grad")
     def zero_grad(self):
         for optimizer in self.optimizers:
             optimizer.zero_grad()
 
     def step_optimizers(self, step):
-        total_norm = 0.0
-        for parameter in self.parameters:
-            if parameter.grad is not None:
-                total_norm += xp.linalg.norm(parameter.grad) ** 2
-        total_norm = xp.sqrt(total_norm)
-        self.last_grad_norm = float(total_norm.item())
-        if self.max_grad_norm is not None and total_norm > self.max_grad_norm:
-            scale = self.max_grad_norm / (total_norm + 1e-6)
+        with time_range("grad_clip"):
+            total_norm = 0.0
             for parameter in self.parameters:
                 if parameter.grad is not None:
-                    parameter.grad *= scale
+                    total_norm += xp.linalg.norm(parameter.grad) ** 2
+            total_norm = xp.sqrt(total_norm)
+            self.last_grad_norm = float(total_norm.item())
+            if self.max_grad_norm is not None and total_norm > self.max_grad_norm:
+                scale = self.max_grad_norm / (total_norm + 1e-6)
+                for parameter in self.parameters:
+                    if parameter.grad is not None:
+                        parameter.grad *= scale
         if self.scheduler is not None:
             self.scheduler.step(step)
         for optimizer in self.optimizers:
-            optimizer.step()
+            with time_range(type(optimizer).__name__):
+                optimizer.step()
 
     def fit(self, train_loader, eval_loader, steps, eval_interval, run, validation_callback=None):
         def validate():
@@ -154,6 +158,7 @@ class LanguageModelTrainer(BaseTrainer):
         self.loss_fn = loss_fn
         self.return_mtp = return_mtp
 
+    @time_range("train_step")
     def train_step(self, batch, step=None):
         inputs, targets = batch["inputs"], batch["targets"]
         loss_mask, token_mask = batch.get("loss_mask"), batch.get("token_mask")
@@ -210,7 +215,8 @@ class LanguageModelTrainer(BaseTrainer):
                 mtp_total += self.last_mtp_loss
                 aux_total += self.last_moe_aux_loss * aux_weight
 
-            loss.backward()
+            with time_range("backward"):
+                loss.backward()
 
             if use_moe:
                 counts = np.stack([to_cpu(block.feed_forward.last_expert_counts) for block in self.model.transformer_blocks])
@@ -237,6 +243,7 @@ class LanguageModelTrainer(BaseTrainer):
             }
         return metrics
 
+    @time_range("forward")
     def _forward_loss(self, inputs, targets, return_mtp, loss_mask, token_mask, segment_ids, document_ids, mtp_masks, mtp_weights, ntp_weight, aux_weight):
         use_moe = getattr(self.model, "use_moe", False)
         mtp_args = {"document_ids": document_ids} if return_mtp and document_ids is not None else {}
