@@ -1,7 +1,6 @@
-from core.backend import xp, to_cpu
+from core.backend import xp, to_cpu, DEVICE
 # from .flash_attention import tiled_attention
 from .triton_attention import tiled_attention
-from .triton_ops import matmul_tensor
 from .tensor import Tensor
 
 class Module:
@@ -50,14 +49,13 @@ class Module:
 class Linear(Module):
     def __init__(self, input_size, output_size):
         super().__init__()
-        self.use_triton = True
         self.weight = Tensor(xp.random.randn(input_size, output_size) * xp.sqrt(2.0 / input_size), require_grad=True)
         self.bias = Tensor(xp.zeros((output_size)), require_grad=True)
 
     def __call__(self, inputs):
         shape = inputs.data.shape
         x = inputs.reshape(-1, shape[-1])
-        output = (matmul_tensor(x, self.weight) if self.use_triton else x @ self.weight) + self.bias
+        output = (x @ self.weight) + self.bias
         return output.reshape(*shape[:-1], self.weight.data.shape[1])
 
     def parameters(self):
@@ -289,9 +287,6 @@ class MoEFeedForward(Module):
         self.use_shared_experts = use_shared_experts
         self.experts = [SwiGLUFeedForward(embedding_dim, self.hidden_dim) for _ in range(num_experts)]
         self.shared_expert = SwiGLUFeedForward(embedding_dim, self.hidden_dim) if use_shared_experts else None
-        for expert in self.experts:
-            for linear in (expert.gate_linear, expert.up_linear, expert.down_linear):
-                linear.use_triton = False
         self.router = Linear(embedding_dim, num_experts)
         self.softmax = Softmax(axis=-1)
         self.router.weight.data[:] = xp.random.randn(*self.router.weight.data.shape) * xp.sqrt(2.0 / embedding_dim)
@@ -314,8 +309,17 @@ class MoEFeedForward(Module):
         grouped = xp.argsort(flat_experts)
 
         counts = (flat_experts[:, None] == xp.arange(self.num_experts)[None, :]).sum(axis=0)
-        host_counts = to_cpu(counts)
-        output = self.shared_expert(x) if self.use_shared_experts else Tensor(xp.zeros_like(x.data))
+        valid = None
+        if return_aux and token_mask is not None:
+            valid = xp.asarray(token_mask, dtype=bool).reshape(-1)
+            assigned = (top_k_indices[:, :, None] == xp.arange(self.num_experts)[None, None, :])
+            valid_counts = (assigned * valid[:, None, None]).sum(axis=(0, 1))
+            valid_tokens = valid.sum().astype(xp.float32)
+            host_counts, host_valid_counts = to_cpu(xp.stack((counts, valid_counts)))
+        else:
+            host_counts = to_cpu(counts)
+
+        outputs = []
         offset = 0
         for expert_id, expert in enumerate(self.experts):
             count = int(host_counts[expert_id])
@@ -323,27 +327,33 @@ class MoEFeedForward(Module):
             offset += count
             if count == 0:
                 continue
-            token_ids, slots = entries // self.top_k, entries % self.top_k
+            token_ids = entries // self.top_k
+            outputs.append(expert(x[token_ids]))
             
-            expert_inputs = x[token_ids]
-            expert_outputs = expert(expert_inputs)
-            expert_weights = top_k_probs[token_ids, slots].reshape(-1, 1)
-            expert_outputs = expert_outputs * expert_weights
+        routed = Tensor.cat(outputs, axis=0)
+        inverse = xp.argsort(grouped)
+        routed = routed[inverse].reshape(num_tokens, self.top_k, embedding_dim)
 
-            output = output + expert_outputs.scatter_add_rows(token_ids, num_tokens)
+        weights = top_k_probs.reshape(num_tokens, self.top_k, 1)
+        output = (routed * weights).sum(axis=1)
+
+        if self.use_shared_experts:
+            output += self.shared_expert(x)
+
         output = output.reshape(batch_size, seq_len, embedding_dim)
 
         if return_aux:
-            if token_mask is not None:
-                valid = xp.asarray(token_mask, dtype=bool).reshape(-1)
-                flat_experts = top_k_indices[valid].reshape(-1)
-                counts = (flat_experts[:, None] == xp.arange(self.num_experts)[None, :]).sum(axis=0)
-                num_tokens = int(valid.sum())
-                router_probs = router_probs[valid]
-                host_counts = to_cpu(counts)
-            self.last_expert_counts = host_counts
-            frequencies = Tensor(counts / float(num_tokens * self.top_k))
-            aux_loss = (frequencies * router_probs.mean(axis=0)).sum() * self.num_experts
+            if valid is not None:
+                self.last_expert_counts = host_valid_counts
+                frequencies = Tensor(valid_counts / (valid_tokens * self.top_k))
+                masked_probs = router_probs * Tensor(valid[:, None].astype(xp.float32))
+                mean_probs = (masked_probs.sum(axis=0) / Tensor(valid_tokens))
+            else:
+                self.last_expert_counts = host_counts
+                frequencies = Tensor(counts / float(num_tokens * self.top_k))
+                mean_probs = router_probs.mean(axis=0)
+
+            aux_loss = (frequencies * mean_probs).sum() * self.num_experts
             return output, aux_loss
 
         return output

@@ -3,7 +3,7 @@
 import argparse
 from pathlib import Path
 
-from core.nn import CrossEntropyLoss
+from core.nn import FusedCrossEntropyLoss
 from core.optimizer import AdamW
 from dataset.language_model_loader import load_sft_data
 from engine.run import TrainingRun, parse_config
@@ -56,7 +56,7 @@ def main(argv=None, *, validation_callback=None):
     trainer = LanguageModelTrainer(
         model, 
         optimizer, 
-        CrossEntropyLoss(), 
+        FusedCrossEntropyLoss(), 
         micro_batch_size=config["micro_batch_size"], 
         scheduler=run.scheduler([optimizer], args)
     )

@@ -168,6 +168,29 @@ class Tensor:
         xp.add.at(out.data, row_ids, self.data)
         return out
 
+    @staticmethod
+    def cat(tensors, axis=0):
+        tensors = tuple(tensors)
+        out = Tensor(
+            xp.concatenate([t.data for t in tensors], axis=axis),
+            require_grad=any(t.require_grad for t in tensors),
+            pre=tensors,
+            opr="cat"
+        )
+
+        def _backward():
+            start = 0
+            for t in tensors:
+                end = start + t.data.shape[axis]
+                if t.require_grad:
+                    slices = [slice(None)] * out.data.ndim
+                    slices[axis] = slice(start, end)
+                    t.grad += out.grad[tuple(slices)]
+                start = end
+
+        out._set_backward(_backward)
+        return out
+
     def log(self):
         out = Tensor(xp.log(self.data), require_grad=self.require_grad, pre=(self,), opr="log")
 
@@ -296,17 +319,14 @@ def checkpoint(module, x, **kwargs):
     parameters = module.parameters()
     with Tensor.no_grad():
         result = module(x, **kwargs)
-    multiple = isinstance(result, tuple)
-    if multiple:
-        shapes = [value.data.shape for value in result]
-        sizes = [value.data.size for value in result]
-        offsets = [0]
-        for size in sizes:
-            offsets.append(offsets[-1] + size)
-        data = xp.concatenate([value.data.reshape(-1) for value in result])
-    else:
-        data = result.data
-    out = Tensor(data, require_grad=x.require_grad or any(p.require_grad for p in parameters), pre=(x, *parameters), opr="checkpoint")
+        multiple = isinstance(result, tuple)
+        if multiple:
+            shapes = [value.data.shape for value in result]
+            offsets = [0]
+            for value in result:
+                offsets.append(offsets[-1] + value.data.size)
+            result = Tensor.cat(value.reshape(-1) for value in result)
+    out = Tensor(result.data, require_grad=x.require_grad or any(p.require_grad for p in parameters), pre=(x, *parameters), opr="checkpoint")
 
     def backward():
         enabled = Tensor._grad_enabled
@@ -315,11 +335,8 @@ def checkpoint(module, x, **kwargs):
             fresh = Tensor(x.data, require_grad=x.require_grad)
             result = module(fresh, **kwargs)
             if multiple:
-                loss = sum((value * Tensor(out.grad[start:end].reshape(shape))).sum()
-                           for value, shape, start, end in zip(result, shapes, offsets[:-1], offsets[1:]))
-            else:
-                loss = (result * Tensor(out.grad)).sum()
-            loss.backward()
+                result = Tensor.cat(value.reshape(-1) for value in result)
+            (result * Tensor(out.grad)).sum().backward()
             if x.require_grad:
                 x.grad += fresh.grad
         finally:

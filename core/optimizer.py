@@ -1,6 +1,5 @@
 from core.backend import xp
 import json
-from core.triton_ops import matmul
 
 class Optimizer:
     @staticmethod
@@ -160,9 +159,9 @@ class Muon(Optimizer):
         if transpose:
             X = X.T
         for _ in range(steps):
-            A = matmul(X, X.T, precision="tf32")
-            B = -4.7750 * A + matmul(2.0315 * A, A, precision="tf32")
-            X = 3.4445 * X + matmul(B, X, precision="tf32")
+            A = X @ X.T
+            B = -4.7750 * A + (2.0315 * A) @ A
+            X = 3.4445 * X + B @ X
         if transpose:
             X = X.T
         return X

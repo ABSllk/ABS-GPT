@@ -24,7 +24,6 @@ class LoRALinear(Linear):
 
         self.weight = base.weight
         self.bias = base.bias
-        self.use_triton = base.use_triton
 
         self.rank = rank
         self.alpha = alpha
