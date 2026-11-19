@@ -58,6 +58,7 @@ def main(argv=None, *, validation_callback=None):
         optimizer, 
         FusedCrossEntropyLoss(), 
         micro_batch_size=config["micro_batch_size"], 
+        micro_batch_size_by_context=config.get("micro_batch_size_by_context"),
         scheduler=run.scheduler([optimizer], args)
     )
     trainer.fit(

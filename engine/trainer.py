@@ -153,10 +153,13 @@ class BaseTrainer:
 
 class LanguageModelTrainer(BaseTrainer):
     def __init__(self, model, optimizer, loss_fn, max_grad_norm=1.0, micro_batch_size=None, scheduler=None,
-                 return_mtp=False):
+                 return_mtp=False, micro_batch_size_by_context=None):
         super().__init__(model, optimizer, max_grad_norm, micro_batch_size, scheduler)
         self.loss_fn = loss_fn
         self.return_mtp = return_mtp
+        self.micro_batch_size_by_context = {
+            int(context): size for context, size in (micro_batch_size_by_context or {}).items()
+        }
 
     @time_range("train_step")
     def train_step(self, batch, step=None):
@@ -166,7 +169,7 @@ class LanguageModelTrainer(BaseTrainer):
         return_mtp = self.return_mtp
         self.zero_grad()
         batch_size = len(inputs)
-        micro = self.micro_batch_size or batch_size
+        micro = self.micro_batch_size_by_context.get(inputs.shape[1], self.micro_batch_size or batch_size)
         total = ntp_total = mtp_total = aux_total = 0.0
         counts_total = None
         use_moe = getattr(self.model, "use_moe", False)            
