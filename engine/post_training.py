@@ -1,8 +1,15 @@
-from core.backend import xp
+import hashlib
+import json
+from pathlib import Path
+
+from core.backend import DEVICE, to_cpu, xp
 from core.nn import LogSoftmax
 from core.tensor import Tensor
 from dataset.language_model_loader import render_prompt
+from engine.checkpoint import Checkpoint
 from engine.generator import Generator
+from engine.metrics import sha256_bytes, write_json
+from engine.run import load_run
 from engine.trainer import BaseTrainer
 
 
@@ -38,6 +45,64 @@ def collate_completions(completions, pad_id):
         token_mask[i, :n] = True
         loss_mask[i, len(prefix) - 1:n] = True
     return dict(inputs=inputs, targets=targets, token_mask=token_mask, loss_mask=loss_mask)
+
+
+def collate_pairs(pairs, pad_id):
+    completions = [answer for pair in pairs for answer in pair]
+    flat = collate_completions(completions, pad_id)
+    return {name: array.reshape(len(pairs), 2, -1) for name, array in flat.items()}
+
+
+def pair_log_probs(model, batch, *, normalize=False):
+    length = batch["inputs"].shape[-1]
+    flat = {name: batch[name].reshape(-1, length) for name in ("inputs", "targets", "token_mask")}
+    logp = model_log_probs(model, flat)
+    mask = batch["loss_mask"].reshape(-1, length)
+    return reduce_completion_log_probs(logp, mask, normalize=normalize).reshape(-1, 2)
+
+
+def _score_reference(model, splits, pad_id, batch_size):
+    scores = {}
+    with Tensor.no_grad():
+        for split, pairs in splits.items():
+            scores[split] = values = []
+            for start in range(0, len(pairs), batch_size):
+                batch = collate_pairs(pairs[start:start + batch_size], pad_id)
+                values.extend(to_cpu(pair_log_probs(model, batch).data).tolist())
+                if start % (batch_size * 10) == 0 or len(values) == len(pairs):
+                    print(f"Reference {split}: {len(values)}/{len(pairs)} pairs", flush=True)
+    return scores
+
+
+def prepare_preference_reference(run, model, tokenizer, splits):
+    reference_path = run.path / "reference.npz"
+    if not run.resume:
+        Checkpoint.save_model(reference_path, model)
+    with reference_path.open("rb") as file:
+        reference_digest = hashlib.file_digest(file, "sha256").hexdigest()
+    context_size = run.config["context_size"]
+    key = {
+        "reference": reference_digest,
+        "tokenizer": sha256_bytes((run.path / "tokenizer.json").read_bytes()),
+        "context_size": context_size,
+        "data": {name: sha256_bytes(Path(run.config["data"][name]["path"]).read_bytes())
+                 for name in splits},
+    }
+    path = run.path / "reference_log_probs.json"
+    cache = json.loads(path.read_text()) if path.exists() else {}
+    if cache.get("key") != key:
+        reference = load_run(run.path, "reference", frozen=True)[0] if run.resume else model
+        batch_size = max(1, min(8, 4096 // context_size))
+        scores = _score_reference(reference, splits, tokenizer.pad_id, batch_size)
+        del reference
+        if DEVICE == "cuda":
+            xp.get_default_memory_pool().free_all_blocks()
+        cache = {"key": key, "scores": scores}
+        write_json(path, cache)
+    for split, pairs in splits.items():
+        for (chosen, rejected), (chosen_logp, rejected_logp) in zip(pairs, cache["scores"][split], strict=True):
+            chosen["reference_logp"] = chosen_logp
+            rejected["reference_logp"] = rejected_logp
 
 
 class PostTrainingTrainer(BaseTrainer):
@@ -186,9 +251,9 @@ class RolloutTrainer(PostTrainingTrainer):
 
 
 class PreferenceTrainer(PostTrainingTrainer):
-    def __init__(self, model, optimizer, reference_model, pad_id, *, loss_fn, preference_inputs=None,
-                 length_normalize=False, **kwargs):
-        self.reference_model = reference_model
+    uses_reference = False
+
+    def __init__(self, model, optimizer, pad_id, *, loss_fn, preference_inputs=None, length_normalize=False, **kwargs):
         self.pad_id = pad_id
         self.preference_inputs = preference_inputs
         self.length_normalize = length_normalize
@@ -200,25 +265,16 @@ class PreferenceTrainer(PostTrainingTrainer):
             loss_fn=loss_fn, **kwargs
         )
 
-    def _pair_log_probs(self, model, batch):
-        tokens = batch["inputs"].shape[-1]
-        flat = {name: batch[name].reshape(-1, tokens) for name in ("inputs", "targets", "token_mask")}
-        logp = model_log_probs(model, flat)
-        mask = batch["loss_mask"].reshape(-1, tokens)
-        return reduce_completion_log_probs(logp, mask, normalize=self.length_normalize).reshape(-1, 2)
-
     def _prepare_pairs(self, pairs, step):
-        examples = [answer for pair in pairs for answer in pair]
-        flat = collate_completions(examples, self.pad_id)
-        batch = {name: array.reshape(len(pairs), 2, -1) for name, array in flat.items()}
-        if self.reference_model is not None:
-            batch["reference"] = xp.concatenate([
-                self._pair_log_probs(self.reference_model, chunk).data for chunk in self._microbatches(batch)
-            ])
-        return batch, len(pairs), {"tokens": int(flat["loss_mask"].sum().item()), "pairs": len(pairs)}
+        batch = collate_pairs(pairs, self.pad_id)
+        if self.uses_reference:
+            batch["reference"] = xp.asarray(
+                [[answer["reference_logp"] for answer in pair] for pair in pairs], dtype=xp.float32,
+            )
+        return batch, len(pairs), {"tokens": int(batch["loss_mask"].sum().item()), "pairs": len(pairs)}
 
     def _loss_inputs(self, model, batch):
-        scores = self._pair_log_probs(model, batch)
+        scores = pair_log_probs(model, batch, normalize=self.length_normalize)
         if "reference" in batch:
             scores = scores - batch["reference"]
         return self.preference_inputs(scores[:, :1] - scores[:, 1:])

@@ -1,6 +1,6 @@
 from core.backend import xp
 from core.tensor import Tensor
-from engine.post_training import PreferenceTrainer, RolloutTrainer, reduce_completion_log_probs
+from engine.post_training import PreferenceTrainer, RolloutTrainer, pair_log_probs, reduce_completion_log_probs
 from engine.post_training_loss import UnifiedLoss
 
 
@@ -67,18 +67,21 @@ def _logistic_inputs(margin):
 
 
 class DPOTrainer(PreferenceTrainer):
-    def __init__(self, model, optimizer, reference_model, pad_id, beta=0.1, **kwargs):
-        self.beta = beta
-        super().__init__(model, optimizer, reference_model, pad_id, loss_fn=UnifiedLoss(power=1, class_axis=-1), preference_inputs=self._dpo_inputs, **kwargs)
+    uses_reference = True
 
-    def _dpo_inputs(self, margin):
-        return _logistic_inputs(self.beta * margin)
+    def __init__(self, model, optimizer, pad_id, beta=0.1, **kwargs):
+        super().__init__(
+            model, optimizer, pad_id, loss_fn=UnifiedLoss(power=1, class_axis=-1),
+            preference_inputs=lambda margin: _logistic_inputs(beta * margin), **kwargs,
+        )
 
 
 class IPOTrainer(PreferenceTrainer):
-    def __init__(self, model, optimizer, reference_model, pad_id, tau=0.1, **kwargs):
+    uses_reference = True
+
+    def __init__(self, model, optimizer, pad_id, tau=0.1, **kwargs):
         super().__init__(
-            model, optimizer, reference_model, pad_id, loss_fn=UnifiedLoss(power=2, weight=2),
+            model, optimizer, pad_id, loss_fn=UnifiedLoss(power=2, weight=2),
             preference_inputs=lambda margin: dict(prediction=margin, target=1 / (2 * tau)), **kwargs,
         )
 
@@ -86,7 +89,7 @@ class IPOTrainer(PreferenceTrainer):
 class SimPOTrainer(PreferenceTrainer):
     def __init__(self, model, optimizer, pad_id, beta=2.0, gamma=0.5, **kwargs):
         super().__init__(
-            model, optimizer, None, pad_id, loss_fn=UnifiedLoss(power=1, class_axis=-1),
+            model, optimizer, pad_id, loss_fn=UnifiedLoss(power=1, class_axis=-1),
             preference_inputs=lambda margin: _logistic_inputs(beta * margin - gamma),
             length_normalize=True, **kwargs,
         )
@@ -96,10 +99,10 @@ class ORPOTrainer(PreferenceTrainer):
     def __init__(self, model, optimizer, pad_id, weight=0.1, **kwargs):
         self.cross_entropy = UnifiedLoss(power=1, class_axis=-1)
         self.preference_weight = weight
-        super().__init__(model, optimizer, None, pad_id, loss_fn=self._orpo_loss, length_normalize=True, **kwargs)
+        super().__init__(model, optimizer, pad_id, loss_fn=self._orpo_loss, length_normalize=True, **kwargs)
 
     def _loss_inputs(self, model, batch):
-        return dict(logp=self._pair_log_probs(model, batch))
+        return dict(logp=pair_log_probs(model, batch, normalize=self.length_normalize))
 
     def _orpo_loss(self, logp):
         log_not_p = (-logp.expm1()).clip(xp.finfo(logp.data.dtype).tiny, 1).log()

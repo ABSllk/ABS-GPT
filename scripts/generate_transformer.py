@@ -59,7 +59,7 @@ def main():
                 break
         else:
             prompt = args.prompt
-        instruction = manifest.get("stage") in ("sft", "grpo")
+        instruction = bool(manifest.get("prompt_template")) or manifest.get("stage") in ("sft", "grpo", "dpo")
         encoded_prompt = render_prompt(prompt) if instruction else prompt
         start_tokens = [tokenizer.bos_id, *tokenizer.encode(encoded_prompt)]
         generator = Generator(model=model, context_size=context_size, seed=args.seed)

@@ -8,6 +8,7 @@ from pathlib import Path
 from core.optimizer import AdamW
 from dataset.language_model_loader import PromptLoader, load_preference_data, load_prompt_data
 from engine.checkpoint import Checkpoint
+from engine.post_training import prepare_preference_reference
 from engine.post_training_algorithms import (
     DAPOLossTrainer,
     DPOTrainer,
@@ -63,8 +64,6 @@ def _make_trainer(model, optimizer, tokenizer, config, reference, **common):
         return trainer
 
     options = {"beta": config["beta"]} if stage == "dpo" else dict(config[stage])
-    if reference is not None:
-        options["reference_model"] = reference
     return PREFERENCE_TRAINERS[stage](model, optimizer, pad_id=tokenizer.pad_id, **options, **common)
 
 
@@ -95,10 +94,15 @@ def main(argv=None, *, validation_callback=None):
     train_loader, eval_rows = _load_data(config, tokenizer)
     parameters = [p for name, p in model.named_parameters() if not name.startswith("mtp_")]
     optimizer = AdamW(parameters, **config["optimizer"])
-    run.start(model, optimizer, train_loader, tokenizer)
+    if not args.resume:
+        run.start(model, optimizer, train_loader, tokenizer)
+    if stage in PREFERENCE_TRAINERS and PREFERENCE_TRAINERS[stage].uses_reference:
+        prepare_preference_reference(run, model, tokenizer, {"train": train_loader.rows, "eval": eval_rows})
+    if args.resume:
+        run.start(model, optimizer, train_loader, tokenizer)
 
     reference = None
-    if stage in {"dpo", "ipo"} or (stage == "grpo" and config["beta"]):
+    if stage == "grpo" and config["beta"]:
         if not args.resume:
             Checkpoint.save_model(run.path / "reference.npz", model)
         reference, _, _ = load_run(run.path, "reference", frozen=True)
