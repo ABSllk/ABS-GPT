@@ -157,6 +157,25 @@ class Tensor:
         out._set_backward(_backward)
         return out
 
+    def expm1(self):
+        out = Tensor(xp.expm1(self.data), require_grad=self.require_grad, pre=(self,), opr="expm1")
+
+        def _backward():
+            self.grad += out.grad * xp.exp(self.data)
+
+        out._set_backward(_backward)
+        return out
+
+    def softplus(self):
+        out = Tensor(xp.logaddexp(0, self.data), require_grad=self.require_grad, pre=(self,), opr="softplus")
+
+        def _backward():
+            if self.require_grad:
+                self.grad += out.grad * xp.exp(-xp.logaddexp(0, -self.data))
+
+        out._set_backward(_backward)
+        return out
+
     def scatter_add_rows(self, row_ids, num_rows):
         out = Tensor(xp.zeros((num_rows, self.data.shape[1]), dtype=self.data.dtype), require_grad=self.require_grad, pre=(self,), opr="scatter_add_rows")
 
@@ -218,6 +237,21 @@ class Tensor:
             if other.require_grad:
                 weight = (self.data > other.data).astype(FLOAT_DTYPE) + equal
                 other.grad += unbroadcast(out.grad * weight, other.grad.shape)
+
+        out._set_backward(_backward)
+        return out
+
+    @staticmethod
+    def where(condition, yes, no):
+        yes, no = Tensor._as_tensor(yes), Tensor._as_tensor(no)
+        out = Tensor(xp.where(condition, yes.data, no.data),
+                     require_grad=yes.require_grad or no.require_grad, pre=(yes, no), opr="where")
+
+        def _backward():
+            if yes.require_grad:
+                yes.grad += unbroadcast(xp.where(condition, out.grad, 0), yes.data.shape)
+            if no.require_grad:
+                no.grad += unbroadcast(xp.where(condition, 0, out.grad), no.data.shape)
 
         out._set_backward(_backward)
         return out
