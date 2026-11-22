@@ -18,8 +18,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def parse_config(parser, filename, argv=None):
-    parser.add_argument("--config", type=Path, default=ROOT / "configs" / filename)
+    parser.add_argument("--config", type=Path, default=None)
     args = parser.parse_args(argv)
+    if args.config is None:
+        default = filename(args) if callable(filename) else filename
+        args.config = ROOT / "configs" / default
     config = None if args.resume else json.loads(args.config.read_text(encoding="utf-8"))
     for name, value in vars(args).copy().items():
         if name.startswith("settings."):
@@ -262,7 +265,7 @@ class TrainingRun:
         write_json(self.path / "summary.json", self.snapshot())
 
 
-def load_run(run_dir, checkpoint="best"):
+def load_run(run_dir, checkpoint="best", *, frozen=False):
     run = Path(run_dir)
     manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
     tokenizer = BPETokenizer.load(run / "tokenizer.json")
@@ -276,4 +279,8 @@ def load_run(run_dir, checkpoint="best"):
         state = ({key.removeprefix("model."): arrays[key] for key in arrays.files if key.startswith("model.")}
                  if checkpoint == "last" else {key: arrays[key] for key in arrays.files})
         model.load_state_dict(state)
+    if frozen:
+        for _, parameter in model.named_parameters(trainable_only=False):
+            parameter.require_grad = False
+            parameter.grad = None
     return model, tokenizer, manifest
