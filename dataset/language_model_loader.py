@@ -280,3 +280,15 @@ def load_prompt_data(path, tokenizer, context_size, max_new_tokens):
     rows = pq.read_table(path).to_pylist()
     budget = context_size - max_new_tokens - 1
     return [row for row in rows if len(tokenizer.encode(render_prompt(row["prompt"]))) <= budget]
+
+
+def load_preference_data(path, tokenizer, context_size):
+    rows = pq.read_table(path, columns=["prompt", "chosen", "rejected"]).to_pylist()
+    pairs = []
+    for row in rows:
+        prefix = [tokenizer.bos_id, *tokenizer.encode(render_prompt(row["prompt"]))]
+        completions = ([*tokenizer.encode(row["chosen"]), tokenizer.eos_id],
+                       [*tokenizer.encode(row["rejected"]), tokenizer.eos_id])
+        if len(prefix) + max(map(len, completions)) - 1 <= context_size:
+            pairs.append(tuple({"prompt_ids": prefix, "completion_ids": tokens} for tokens in completions))
+    return pairs
