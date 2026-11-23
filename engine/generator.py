@@ -1,6 +1,6 @@
 from core.tensor import Tensor
 from core.backend import xp
-from core.nn import Softmax
+from core.nn import KVCache, Softmax
 
 class Generator:
     def __init__(self, model, context_size, seed=None):
@@ -13,18 +13,18 @@ class Generator:
         tokens = list(start_tokens)
         generated = []
         finish_reason = "length"
-        cache = [{} for _ in self.model.transformer_blocks]
+        cache = [KVCache(self.context_size) for _ in self.model.transformer_blocks]
 
         with Tensor.no_grad():
             for _ in range(max_new_tokens):
-                past_len = cache[0]["K"].shape[2] if cache[0] else 0
+                past_len = cache[0].length
 
                 # 若窗口满了，则清空缓存
                 if 0 < past_len < self.context_size:
                     current_tokens = tokens[-1:]
                 else:
                     for layer_cache in cache:
-                        layer_cache.clear()
+                        layer_cache.length = 0
                     current_tokens = tokens[-self.context_size:]
 
                 context = xp.array([current_tokens], dtype=xp.int64)

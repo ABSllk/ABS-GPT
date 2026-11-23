@@ -1,6 +1,7 @@
 from core.backend import xp, to_cpu, DEVICE
 # from .flash_attention import tiled_attention
 from .triton_attention import tiled_attention
+from .triton_ops import grouped_linear
 from .tensor import Tensor
 
 class Module:
@@ -157,6 +158,26 @@ class FusedCrossEntropyLoss(Module):
         out._set_backward(backward)
         return out
 
+class KVCache:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.length = 0
+        self.data = None
+
+    def append(self, key, value):
+        batch, heads, tokens, width = key.shape
+        if self.data is None:
+            self.data = xp.empty((2, batch, heads, self.capacity, width), dtype=key.dtype)
+        end = self.length + tokens
+        self.data[0, :batch, :, self.length:end] = key
+        self.data[1, :batch, :, self.length:end] = value
+        self.length = end
+        return self.data[0, :batch, :, :end], self.data[1, :batch, :, :end]
+
+    def retain(self, rows):
+        self.data[:, :len(rows), :, :self.length] = self.data[:, rows, :, :self.length]
+
+
 class SelfAttention(Module):
     def __init__(self, head_size, head_num, kv_head_num=None):
         super().__init__()
@@ -190,17 +211,14 @@ class SelfAttention(Module):
         K = self.W_k(inputs).reshape(batch_size, seq_len, self.kv_head_num, self.head_size).transpose(0, 2, 1, 3)
         V = self.W_v(inputs).reshape(batch_size, seq_len, self.kv_head_num, self.head_size).transpose(0, 2, 1, 3)
         
-        past_length = cache["K"].shape[2] if cache is not None and "K" in cache else 0
+        past_length = cache.length if cache is not None else 0
 
         Q = self.rope(Q, past_length)
         K = self.rope(K, past_length)
 
         if cache is not None:
-            if "K" in cache:
-                K = Tensor(xp.concatenate([cache["K"], K.data], axis=2))
-                V = Tensor(xp.concatenate([cache["V"], V.data], axis=2))
-            cache["K"] = K.data
-            cache["V"] = V.data
+            keys, values = cache.append(K.data, V.data)
+            K, V = Tensor(keys), Tensor(values)
 
         # 普通的注意力计算
         # scores = Q @ K.transpose(0, 1, 3, 2) / xp.sqrt(self.head_size)
@@ -292,6 +310,23 @@ class MoEFeedForward(Module):
         self.router.weight.data[:] = xp.random.randn(*self.router.weight.data.shape) * xp.sqrt(2.0 / embedding_dim)
         self.router.bias.data.fill(0)
 
+    def _grouped_experts(self, inputs, projections, ends, max_rows):
+        # Each entry gives Triton the original weight and bias pointers and strides.
+        descriptors = []
+        for layer in projections:
+            weight, bias = layer.weight.data, layer.bias.data
+            descriptors.append((
+                weight.data.ptr, 
+                bias.data.ptr,
+                *(stride // weight.itemsize for stride in weight.strides),
+                bias.strides[0] // bias.itemsize
+            ))
+        gate, up, down = xp.asarray(descriptors, dtype=xp.int64).reshape(3, self.num_experts, 5)
+        gate_output = grouped_linear(inputs, gate, ends, max_rows, self.hidden_dim)
+        up_output = grouped_linear(inputs, up, ends, max_rows, self.hidden_dim)
+        hidden = Tensor(gate_output).silu().data * up_output
+        return Tensor(grouped_linear(hidden, down, ends, max_rows, inputs.shape[1]))
+
     def __call__(self, inputs, return_aux=False, token_mask=None):
         batch_size, seq_len, embedding_dim = inputs.data.shape
         x = inputs.reshape(-1, embedding_dim)
@@ -304,37 +339,58 @@ class MoEFeedForward(Module):
         rows = xp.arange(num_tokens)[:, None]
         top_k_probs = router_probs[rows, top_k_indices]
         top_k_probs = top_k_probs / top_k_probs.sum(axis=-1, keepdims=True)
+        weights = top_k_probs.reshape(num_tokens, self.top_k, 1)
 
         flat_experts = top_k_indices.reshape(-1)
         grouped = xp.argsort(flat_experts)
-
         counts = (flat_experts[:, None] == xp.arange(self.num_experts)[None, :]).sum(axis=0)
-        valid = None
-        if return_aux and token_mask is not None:
-            valid = xp.asarray(token_mask, dtype=bool).reshape(-1)
-            assigned = (top_k_indices[:, :, None] == xp.arange(self.num_experts)[None, None, :])
-            valid_counts = (assigned * valid[:, None, None]).sum(axis=(0, 1))
-            valid_tokens = valid.sum().astype(xp.float32)
-            host_counts, host_valid_counts = to_cpu(xp.stack((counts, valid_counts)))
-        else:
-            host_counts = to_cpu(counts)
 
-        outputs = []
-        offset = 0
-        for expert_id, expert in enumerate(self.experts):
-            count = int(host_counts[expert_id])
-            entries = grouped[offset:offset + count]
-            offset += count
-            if count == 0:
-                continue
-            token_ids = entries // self.top_k
-            outputs.append(expert(x[token_ids]))
-            
-        routed = Tensor.cat(outputs, axis=0)
+        projections = ()
+        if (
+            seq_len == 1             and
+            not return_aux           and
+            DEVICE == "cuda"         and
+            not Tensor._grad_enabled and
+            all(type(expert) is SwiGLUFeedForward for expert in self.experts)
+        ):
+            projections = tuple(
+                getattr(expert, name)
+                for name in ("gate_linear", "up_linear", "down_linear")
+                for expert in self.experts
+            )
+
+        valid = None
+        if projections and all(
+            type(layer) is Linear and layer.weight.data.dtype == layer.bias.data.dtype == x.data.dtype
+            for layer in projections
+        ):
+            ends = xp.cumsum(counts, dtype=xp.int32)
+            routed = self._grouped_experts(x.data[grouped // self.top_k], projections, ends, num_tokens)
+        else:
+            if return_aux and token_mask is not None:
+                valid = xp.asarray(token_mask, dtype=bool).reshape(-1)
+                assigned = (top_k_indices[:, :, None] == xp.arange(self.num_experts)[None, None, :])
+                valid_counts = (assigned * valid[:, None, None]).sum(axis=(0, 1))
+                valid_tokens = valid.sum().astype(xp.float32)
+                host_counts, host_valid_counts = to_cpu(xp.stack((counts, valid_counts)))
+            else:
+                host_counts = to_cpu(counts)
+
+            outputs = []
+            offset = 0
+            for expert_id, expert in enumerate(self.experts):
+                count = int(host_counts[expert_id])
+                entries = grouped[offset:offset + count]
+                offset += count
+                if count == 0:
+                    continue
+                token_ids = entries // self.top_k
+                outputs.append(expert(x[token_ids]))
+            routed = Tensor.cat(outputs, axis=0)
+
         inverse = xp.argsort(grouped)
         routed = routed[inverse].reshape(num_tokens, self.top_k, embedding_dim)
 
-        weights = top_k_probs.reshape(num_tokens, self.top_k, 1)
         output = (routed * weights).sum(axis=1)
 
         if self.use_shared_experts:

@@ -86,6 +86,42 @@ def matmul(a, b, precision="ieee"):
         32, 64, 32, precision, num_warps=4, num_stages=3)
     return c
 
+@triton.jit
+def _grouped_linear(X, PARAMS, ENDS, Y, K: tl.constexpr, N: tl.constexpr,
+                    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    expert = tl.program_id(0)
+    start = tl.load(ENDS + expert - 1, expert > 0, 0)
+    end = tl.load(ENDS + expert)
+    first_row = start + tl.program_id(1) * BM
+    if first_row < end:
+        params = PARAMS + expert * 5
+        w = tl.load(params).to(tl.pointer_type(X.dtype.element_ty))
+        bias = tl.load(params + 1).to(tl.pointer_type(X.dtype.element_ty))
+        wk = tl.load(params + 2)
+        wn = tl.load(params + 3)
+        bs = tl.load(params + 4)
+        rows = first_row + tl.arange(0, BM)
+        cols = tl.program_id(2) * BN + tl.arange(0, BN)
+        acc = tl.zeros((BM, BN), tl.float32)
+        for block in range(tl.cdiv(K, BK)):
+            ks = block * BK + tl.arange(0, BK)
+            a = tl.load(X + rows[:, None] * K + ks[None, :],
+                        (rows[:, None] < end) & (ks[None, :] < K), 0)
+            b = tl.load(w + ks[:, None] * wk + cols[None, :] * wn,
+                        (ks[:, None] < K) & (cols[None, :] < N), 0)
+            acc += tl.dot(a, b, input_precision="tf32x3")
+        acc += tl.load(bias + cols * bs, cols < N, 0)[None, :]
+        tl.store(Y + rows[:, None] * N + cols[None, :], acc,
+                 (rows[:, None] < end) & (cols[None, :] < N))
+
+
+def grouped_linear(x, params, ends, max_rows, out_dim):
+    x = cp.ascontiguousarray(x)
+    out = cp.empty((x.shape[0], out_dim), dtype=x.dtype)
+    grid = (ends.size, triton.cdiv(max_rows, 16), triton.cdiv(out_dim, 64))
+    _grouped_linear[grid](Pointer(x), Pointer(params), Pointer(ends), Pointer(out), x.shape[1], out_dim, 16, 64, 32)
+    return out
+
 def softmax_tensor(x):
     y = softmax(x.data)
     out = Tensor(y, require_grad=x.require_grad, pre=(x,), opr="triton_softmax")

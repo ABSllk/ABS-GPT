@@ -53,11 +53,7 @@ class TransformerLanguageModel(Module):
                         layer.weight.data[:] = xp.random.uniform(-0.4 * s, 0.4 * s, layer.weight.data.shape)
 
     def __call__(self, inputs, cache=None, return_mtp=False, return_aux=False, token_mask=None, segment_ids=None, document_ids=None):
-        seq_length = inputs.shape[1]
-        past_len = cache[0]["K"].shape[2] if cache and cache[0] else 0
         mtp_logit = []
-        # positions = past_len + np.arange(seq_length)
-        # x = self.embedding(inputs) + self.position_embedding(positions)
         x = self.embedding(inputs)
         aux_losses = []
         for i, block in enumerate(self.transformer_blocks):
