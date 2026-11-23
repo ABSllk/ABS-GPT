@@ -1,5 +1,6 @@
 import hashlib
 import json
+from math import inf
 from pathlib import Path
 
 from core.backend import DEVICE, to_cpu, xp
@@ -9,6 +10,7 @@ from dataset.language_model_loader import render_prompt
 from engine.checkpoint import Checkpoint
 from engine.generator import Generator
 from engine.metrics import sha256_bytes, write_json
+from engine.post_training_loss import UnifiedLoss
 from engine.run import load_run
 from engine.trainer import BaseTrainer
 
@@ -173,6 +175,7 @@ class RolloutTrainer(PostTrainingTrainer):
         self, model, optimizer, tokenizer, loss_fn, reward_fn, context_size=512,
         group_size=4, max_new_tokens=128, micro_batch_size=1, scheduler=None,
         reference_fn=None, seed=42, max_grad_norm=1.0, *, advantage_fn=None, loss_inputs=None,
+        kl_weight=0.0, clip_epsilon=None,
     ):
         self.tokenizer = tokenizer
         self.reward_fn = reward_fn
@@ -181,6 +184,15 @@ class RolloutTrainer(PostTrainingTrainer):
         self.max_new_tokens = max_new_tokens
         self.reference_fn = reference_fn
         self.seed = seed
+        self.kl_weight = kl_weight
+        self.clip_epsilon = clip_epsilon
+        self._uses_default_loss = loss_fn is None
+        if self._uses_default_loss:
+            self.policy_curve = UnifiedLoss(0)
+            self.reference_curve = UnifiedLoss(inf)
+            loss_fn = self._rollout_loss
+            if loss_inputs is None:
+                loss_inputs = self._clipped_policy_inputs
         super().__init__(
             model, optimizer, prepare_batch=self._prepare_rollouts, evaluate_fn=self._evaluate_rollouts,
             loss_inputs=self._policy_inputs if loss_inputs is None else loss_inputs, loss_fn=loss_fn,
@@ -222,10 +234,6 @@ class RolloutTrainer(PostTrainingTrainer):
         }
         return rollouts, rewards, metrics
 
-    @property
-    def uses_reference(self):
-        return self.reference_fn is not None
-
     def loss_normalizer(self, metrics):
         return metrics["tokens"]
 
@@ -233,7 +241,8 @@ class RolloutTrainer(PostTrainingTrainer):
         rollouts, rewards, metrics = self._score_rollouts(rows, self.seed + step)
         batch = collate_completions(rollouts, self.tokenizer.pad_id)
         old = self.log_probs(batch)
-        if self.uses_reference:
+        needs_reference = bool(self.kl_weight) if self._uses_default_loss else self.reference_fn is not None
+        if needs_reference:
             batch["reference"] = self.reference_fn(batch)
         batch.update(rewards=rewards, old=old)
         metrics.update(tokens=int(batch["loss_mask"].sum().item()), responses=len(rollouts),
@@ -244,6 +253,45 @@ class RolloutTrainer(PostTrainingTrainer):
     def _policy_inputs(model, batch):
         return dict(current=model_log_probs(model, batch), old=batch["old"], mask=batch["loss_mask"],
                     advantages=batch.get("advantages"), reference=batch.get("reference"))
+
+    @staticmethod
+    def policy_terms(current, old, advantages, mask, reference=None):
+        mask = xp.asarray(mask, dtype=bool)
+        logp = current[mask]
+        advantage = Tensor._as_tensor(advantages).data
+        if advantage.ndim == 1:
+            advantage = advantage[:, None]
+        advantage = xp.broadcast_to(advantage, current.data.shape)[mask]
+        ratio = (logp - Tensor._as_tensor(old).data[mask]).exp()
+        reference_log_ratio = None if reference is None else -(logp - Tensor._as_tensor(reference).data[mask])
+        return ratio, advantage, reference_log_ratio
+
+    def _clipped_policy_inputs(self, model, batch):
+        ratio, advantage, reference_log_ratio = self.policy_terms(**self._policy_inputs(model, batch))
+        if isinstance(advantage, Tensor):
+            advantage = advantage.data
+        epsilon = self.clip_epsilon
+        if epsilon is not None:
+            low, high = epsilon if isinstance(epsilon, (list, tuple)) else (epsilon, epsilon)
+            direction = xp.asarray(advantage)
+            dtype = ratio.data.dtype
+            lower = xp.where(direction < 0, 1 - low, 0).astype(dtype)
+            upper = xp.where(direction > 0, 1 + high, xp.inf).astype(dtype)
+            ratio = ratio.clip(lower, upper)
+        return dict(z=ratio, advantage=advantage, reference_log_ratio=reference_log_ratio)
+
+    def _rollout_loss(self, z, advantage, reference_log_ratio):
+        loss = self.policy_curve(z) * advantage
+        if self.kl_weight:
+            kl = self.reference_curve(reference_log_ratio, offset=1)
+            return loss + self.kl_weight * kl, {"divergence_sum": float(kl.data.sum().item())}
+        return loss, {"divergence_sum": 0.0}
+
+    def train_step(self, rows, step):
+        metrics = super().train_step(rows, step)
+        if self._uses_default_loss:
+            metrics["kl"] = metrics.pop("divergence_sum") / metrics["tokens"]
+        return metrics
 
     def _evaluate_rollouts(self, rows):
         _, _, metrics = self._score_rollouts(rows, self.seed)

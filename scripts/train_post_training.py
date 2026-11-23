@@ -18,7 +18,6 @@ from engine.post_training_algorithms import (
     ORPOTrainer,
     SimPOTrainer,
 )
-from engine.post_training_loss import UnifiedLoss
 from engine.run import TrainingRun, load_run, parse_config
 
 
@@ -54,10 +53,16 @@ def _make_trainer(model, optimizer, tokenizer, config, reference, **common):
         reward_fn = getattr(import_module(module), name)
         epsilon = config[stage]["epsilon"] if stage in {"gspo", "dapo_loss"} else config["epsilon"]
         trainer = ROLLOUT_TRAINERS[stage](
-            model, optimizer, tokenizer, UnifiedLoss(power=0, weight=config["beta"], clip_epsilon=epsilon), reward_fn,
-            context_size=config["context_size"], group_size=config["group_size"], max_new_tokens=config["max_new_tokens"],
+            model, optimizer, tokenizer, reward_fn, 
+            kl_weight=config["beta"], 
+            clip_epsilon=epsilon,
+            context_size=config["context_size"], 
+            group_size=config["group_size"], 
+            max_new_tokens=config["max_new_tokens"],
             standardize_advantages=config.get("standardize_advantages", True),
-            max_grad_norm=config["max_grad_norm"], seed=config["seed"], **common,
+            max_grad_norm=config["max_grad_norm"], 
+            seed=config["seed"], 
+            **common
         )
         if reference is not None:
             trainer.reference_fn = partial(trainer.log_probs, model=reference)
@@ -108,11 +113,22 @@ def main(argv=None, *, validation_callback=None):
         reference, _, _ = load_run(run.path, "reference", frozen=True)
 
     trainer = _make_trainer(
-        model, optimizer, tokenizer, config, reference,
-        micro_batch_size=config["micro_batch_size"], scheduler=run.scheduler([optimizer]),
+        model,
+        optimizer,
+        tokenizer,
+        config,
+        reference,
+        micro_batch_size=config["micro_batch_size"],
+        scheduler=run.scheduler([optimizer])
     )
-    trainer.fit(train_loader, eval_rows, config["planned_steps"], config["eval_interval"], run,
-                validation_callback=validation_callback)
+    trainer.fit(
+        train_loader,
+        eval_rows,
+        config["planned_steps"],
+        config["eval_interval"],
+        run,
+        validation_callback=validation_callback
+    )
 
 
 if __name__ == "__main__":
