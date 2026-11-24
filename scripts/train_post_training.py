@@ -68,7 +68,7 @@ def _make_trainer(model, optimizer, tokenizer, config, reference, **common):
             trainer.reference_fn = partial(trainer.log_probs, model=reference)
         return trainer
 
-    options = {"beta": config["beta"]} if stage == "dpo" else dict(config[stage])
+    options = {"beta": config["beta"], "n": config.get("dpo_n", 1.0)} if stage == "dpo" else dict(config[stage])
     return PREFERENCE_TRAINERS[stage](model, optimizer, pad_id=tokenizer.pad_id, **options, **common)
 
 
@@ -83,6 +83,7 @@ def main(argv=None, *, validation_callback=None):
     parser.add_argument("--train-data", dest="settings.data.train.path", type=Path)
     parser.add_argument("--eval-data", dest="settings.data.eval.path", type=Path)
     parser.add_argument("--beta", dest="settings.beta", type=float, help="GRPO KL weight or DPO beta")
+    parser.add_argument("--dpo-n", dest="settings.dpo_n", type=float, help="DPO UnifiedLoss n")
     parser.add_argument("--lr", dest="settings.optimizer.lr", type=float)
     parser.add_argument("--batch-size", dest="settings.batch_size", type=int)
     parser.add_argument("--micro-batch-size", dest="settings.micro_batch_size", type=int)

@@ -34,12 +34,12 @@ class DAPOLossTrainer(GRPOTrainer):
 class DPOTrainer(PreferenceTrainer):
     uses_reference = True
 
-    def __init__(self, model, optimizer, pad_id, beta=0.1, **kwargs):
+    def __init__(self, model, optimizer, pad_id, beta=0.1, n=1.0, **kwargs):
         super().__init__(
             model, 
             optimizer, 
             pad_id, 
-            loss_fn=UnifiedLoss(1),
+            loss_fn=UnifiedLoss(n),
             preference_inputs=lambda margin: dict(z=beta * margin), 
             **kwargs
         )
