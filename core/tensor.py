@@ -1,6 +1,18 @@
 from core.backend import xp, FLOAT_DTYPE
 from contextlib import contextmanager
 
+def _is_basic_index(index):
+    if isinstance(index, (slice, type(None), type(Ellipsis))) or (isinstance(index, int) and not isinstance(index, bool)):
+        return True
+    if isinstance(index, tuple):
+        return all(
+            isinstance(item, (slice, type(None), type(Ellipsis)))
+            or (isinstance(item, int) and not isinstance(item, bool))
+            for item in index
+        )
+    return isinstance(index, xp.ndarray) and index.dtype.kind == "b"
+
+
 def unbroadcast(grad, shape):
     if grad.shape == shape:
         return grad
@@ -26,7 +38,7 @@ class Tensor:
         self.data = xp.asarray(data, dtype=FLOAT_DTYPE)
         self.require_grad = require_grad and (Tensor._grad_enabled or len(pre) == 0)
         self.grad = xp.zeros_like(self.data) if self.require_grad and not pre else None
-        self.pre = pre if self.require_grad else ()
+        self.pre = tuple(p for p in pre if p.require_grad) if self.require_grad else ()
         self.opr = opr
 
         self._backward = lambda: None
@@ -34,6 +46,17 @@ class Tensor:
     def _set_backward(self, backward_fn):
         if self.require_grad:
             self._backward = backward_fn
+
+    def accumulate_grad(self, grad):
+        if not self.require_grad:
+            return
+        if self.grad is None:
+            if grad.shape != self.data.shape:
+                self.grad = xp.broadcast_to(grad, self.data.shape).copy()
+            else:
+                self.grad = grad
+        else:
+            self.grad += grad
 
     def __repr__(self):
         return f"Tensor(data={self.data}, grad={self.grad}, opr={self.opr!r})"
@@ -47,10 +70,14 @@ class Tensor:
         out = Tensor(self.data + other.data, require_grad=self.require_grad or other.require_grad, pre=(self, other), opr="+")
 
         def _backward():
+            g_self = unbroadcast(out.grad, self.data.shape) if self.require_grad else None
+            g_other = unbroadcast(out.grad, other.data.shape) if other.require_grad else None
+            if g_self is out.grad and g_other is out.grad:
+                g_other = out.grad.copy()
             if self.require_grad:
-                self.grad += unbroadcast(out.grad, self.grad.shape)
+                self.accumulate_grad(g_self)
             if other.require_grad:
-                other.grad += unbroadcast(out.grad, other.grad.shape)
+                other.accumulate_grad(g_other)
 
         out._set_backward(_backward)
         return out
@@ -61,9 +88,9 @@ class Tensor:
 
         def _backward():
             if self.require_grad:
-                self.grad += unbroadcast(out.grad * other.data, self.grad.shape)
+                self.accumulate_grad(unbroadcast(out.grad * other.data, self.data.shape))
             if other.require_grad:
-                other.grad += unbroadcast(out.grad * self.data, other.grad.shape)
+                other.accumulate_grad(unbroadcast(out.grad * self.data, other.data.shape))
 
         out._set_backward(_backward)
         return out
@@ -74,10 +101,9 @@ class Tensor:
 
         def _backward():
             if self.require_grad:
-                self.grad += unbroadcast(out.grad @ xp.swapaxes(other.data, -1, -2), self.grad.shape)
-
+                self.accumulate_grad(unbroadcast(out.grad @ xp.swapaxes(other.data, -1, -2), self.data.shape))
             if other.require_grad:
-                other.grad += unbroadcast(xp.swapaxes(self.data, -1, -2) @ out.grad, other.grad.shape)
+                other.accumulate_grad(unbroadcast(xp.swapaxes(self.data, -1, -2) @ out.grad, other.data.shape))
 
         out._set_backward(_backward)
         return out
@@ -87,7 +113,7 @@ class Tensor:
 
         def _backward():
             if self.require_grad:
-                self.grad += out.grad * power * (self.data ** (power - 1))
+                self.accumulate_grad(out.grad * power * (self.data ** (power - 1)))
 
         out._set_backward(_backward)
         return out
@@ -99,20 +125,53 @@ class Tensor:
         return self * other
 
     def __neg__(self):
-        return self * Tensor(-1.0)
+        out = Tensor(-self.data, require_grad=self.require_grad, pre=(self,), opr="neg")
+
+        def _backward():
+            if self.require_grad:
+                self.accumulate_grad(-out.grad)
+
+        out._set_backward(_backward)
+        return out
 
     def __sub__(self, other):
-        return self + (-other)
+        other = self._as_tensor(other)
+        out = Tensor(self.data - other.data, require_grad=self.require_grad or other.require_grad, pre=(self, other), opr="-")
+
+        def _backward():
+            if self.require_grad:
+                self.accumulate_grad(unbroadcast(out.grad, self.data.shape))
+            if other.require_grad:
+                other.accumulate_grad(unbroadcast(-out.grad, other.data.shape))
+
+        out._set_backward(_backward)
+        return out
+
+    def __rsub__(self, other):
+        return self._as_tensor(other) - self
 
     def __truediv__(self, other):
-        return self * (other ** -1)
+        other = self._as_tensor(other)
+        out = Tensor(self.data / other.data, require_grad=self.require_grad or other.require_grad, pre=(self, other), opr="/")
+
+        def _backward():
+            if self.require_grad:
+                self.accumulate_grad(unbroadcast(out.grad / other.data, self.data.shape))
+            if other.require_grad:
+                other.accumulate_grad(unbroadcast(-out.grad * out.data / other.data, other.data.shape))
+
+        out._set_backward(_backward)
+        return out
+
+    def __rtruediv__(self, other):
+        return self._as_tensor(other) / self
 
     def relu(self):
         out = Tensor(xp.maximum(0, self.data), require_grad=self.require_grad, pre=(self,), opr="relu")
 
         def _backward():
             if self.require_grad:
-                self.grad += out.grad * (self.data > 0).astype(FLOAT_DTYPE)
+                self.accumulate_grad(out.grad * (self.data > 0).astype(FLOAT_DTYPE))
 
         out._set_backward(_backward)
         return out
@@ -123,7 +182,7 @@ class Tensor:
         out = Tensor(self.data * sigmoid, require_grad=self.require_grad, pre=(self,), opr="silu")
         def _backward():
             if self.require_grad:
-                self.grad += out.grad * (sigmoid * (1 + self.data * (1 - sigmoid)))
+                self.accumulate_grad(out.grad * (sigmoid * (1 + self.data * (1 - sigmoid))))
 
         out._set_backward(_backward)
         return out
@@ -136,23 +195,31 @@ class Tensor:
                 grad = out.grad
                 if axis is not None and not keepdims:
                     grad = xp.expand_dims(grad, axis=axis)
-                # Broadcasting adds the reduced gradient without allocating
-                # an input-sized ones array and a second product array.
-                self.grad += grad
+                self.accumulate_grad(grad)
 
         out._set_backward(_backward)
         return out
 
     def mean(self, axis=None, keepdims=False):
-        s = self.sum(axis=axis, keepdims=keepdims)
-        return s / (self.data.size // s.data.size)
+        out = Tensor(xp.mean(self.data, axis=axis, keepdims=keepdims), require_grad=self.require_grad, pre=(self,), opr="mean")
+        scale = self.data.size // out.data.size
+
+        def _backward():
+            if self.require_grad:
+                grad = out.grad / scale
+                if axis is not None and not keepdims:
+                    grad = xp.expand_dims(grad, axis=axis)
+                self.accumulate_grad(grad)
+
+        out._set_backward(_backward)
+        return out
 
     def exp(self):
         out = Tensor(xp.exp(self.data), require_grad=self.require_grad, pre=(self,), opr="exp")
 
         def _backward():
             if self.require_grad:
-                self.grad += out.grad * out.data
+                self.accumulate_grad(out.grad * out.data)
 
         out._set_backward(_backward)
         return out
@@ -161,7 +228,8 @@ class Tensor:
         out = Tensor(xp.expm1(self.data), require_grad=self.require_grad, pre=(self,), opr="expm1")
 
         def _backward():
-            self.grad += out.grad * xp.exp(self.data)
+            if self.require_grad:
+                self.accumulate_grad(out.grad * (out.data + 1))
 
         out._set_backward(_backward)
         return out
@@ -171,7 +239,7 @@ class Tensor:
 
         def _backward():
             if self.require_grad:
-                self.grad += out.grad * xp.exp(-xp.logaddexp(0, -self.data))
+                self.accumulate_grad(out.grad * xp.exp(-xp.logaddexp(0, -self.data)))
 
         out._set_backward(_backward)
         return out
@@ -181,7 +249,7 @@ class Tensor:
 
         def _backward():
             if self.require_grad:
-                self.grad += out.grad[row_ids]
+                self.accumulate_grad(out.grad[row_ids])
 
         out._set_backward(_backward)
         xp.add.at(out.data, row_ids, self.data)
@@ -204,7 +272,7 @@ class Tensor:
                 if t.require_grad:
                     slices = [slice(None)] * out.data.ndim
                     slices[axis] = slice(start, end)
-                    t.grad += out.grad[tuple(slices)]
+                    t.accumulate_grad(out.grad[tuple(slices)])
                 start = end
 
         out._set_backward(_backward)
@@ -215,7 +283,7 @@ class Tensor:
 
         def _backward():
             if self.require_grad:
-                self.grad += out.grad / self.data
+                self.accumulate_grad(out.grad / self.data)
 
         out._set_backward(_backward)
         return out
@@ -233,10 +301,10 @@ class Tensor:
             equal = (self.data == other.data).astype(FLOAT_DTYPE) * 0.5
             if self.require_grad:
                 weight = (self.data < other.data).astype(FLOAT_DTYPE) + equal
-                self.grad += unbroadcast(out.grad * weight, self.grad.shape)
+                self.accumulate_grad(unbroadcast(out.grad * weight, self.data.shape))
             if other.require_grad:
                 weight = (self.data > other.data).astype(FLOAT_DTYPE) + equal
-                other.grad += unbroadcast(out.grad * weight, other.grad.shape)
+                other.accumulate_grad(unbroadcast(out.grad * weight, other.data.shape))
 
         out._set_backward(_backward)
         return out
@@ -249,9 +317,9 @@ class Tensor:
 
         def _backward():
             if yes.require_grad:
-                yes.grad += unbroadcast(xp.where(condition, out.grad, 0), yes.data.shape)
+                yes.accumulate_grad(unbroadcast(xp.where(condition, out.grad, 0), yes.data.shape))
             if no.require_grad:
-                no.grad += unbroadcast(xp.where(condition, 0, out.grad), no.data.shape)
+                no.accumulate_grad(unbroadcast(xp.where(condition, 0, out.grad), no.data.shape))
 
         out._set_backward(_backward)
         return out
@@ -262,7 +330,7 @@ class Tensor:
         def _backward():
             if self.require_grad:
                 mask = (self.data >= min_value) & (self.data <= max_value)
-                self.grad += out.grad * mask
+                self.accumulate_grad(out.grad * mask)
 
         out._set_backward(_backward)
         return out
@@ -272,7 +340,16 @@ class Tensor:
         
         def _backward():
             if self.require_grad:
-                xp.add.at(self.grad, index, out.grad)
+                if self.grad is None:
+                    self.grad = xp.zeros_like(self.data)
+                    if _is_basic_index(index):
+                        self.grad[index] = out.grad
+                    else:
+                        xp.add.at(self.grad, index, out.grad)
+                elif _is_basic_index(index):
+                    self.grad[index] += out.grad
+                else:
+                    xp.add.at(self.grad, index, out.grad)
 
         out._set_backward(_backward)
         return out
@@ -282,7 +359,7 @@ class Tensor:
 
         def _backward():
             if self.require_grad:
-                self.grad += out.grad.reshape(self.data.shape)
+                self.accumulate_grad(out.grad.reshape(self.data.shape))
 
         out._set_backward(_backward)
         return out
@@ -292,7 +369,7 @@ class Tensor:
 
         def _backward():
             if self.require_grad:
-                self.grad += out.grad.transpose(*(axes.index(i) for i in range(len(axes))))
+                self.accumulate_grad(out.grad.transpose(*(axes.index(i) for i in range(len(axes)))))
 
         out._set_backward(_backward)
         return out
@@ -304,7 +381,7 @@ class Tensor:
             else:
                 self.grad.fill(0)
 
-    def backward(self, retain_graph=False):
+    def backward(self, grad=None, retain_graph=False):
         topo = []
         visited = set()
 
@@ -322,11 +399,13 @@ class Tensor:
             pending.append((node, True))
             pending.extend((child, False) for child in reversed(node.pre))
 
-        # 中间梯度必须在显式保留图时重置，防止混入上一轮的梯度
+        # 中间梯度在反向前清空，由首次写入按需接管，避免预先 zeros_like + +=
         for node in topo:
-            if node.pre and node.grad is not None:
-                node.grad.fill(0)
-        if self.grad is None:
+            if node.pre:
+                node.grad = None
+        if grad is not None:
+            self.grad = xp.array(grad, dtype=FLOAT_DTYPE, copy=True)
+        elif self.grad is None:
             self.grad = xp.ones_like(self.data)
         else:
             self.grad.fill(1)
@@ -335,9 +414,6 @@ class Tensor:
         visited.clear()
         while topo:
             node = topo.pop()
-            for child in node.pre:
-                if child.require_grad and child.grad is None:
-                    child.grad = xp.zeros_like(child.data)
             if node._backward:
                 node._backward()
             if not retain_graph and node.pre:
@@ -370,9 +446,9 @@ def checkpoint(module, x, **kwargs):
             result = module(fresh, **kwargs)
             if multiple:
                 result = Tensor.cat(value.reshape(-1) for value in result)
-            (result * Tensor(out.grad)).sum().backward()
+            result.backward(out.grad)
             if x.require_grad:
-                x.grad += fresh.grad
+                x.accumulate_grad(fresh.grad)
         finally:
             Tensor._grad_enabled = enabled
 

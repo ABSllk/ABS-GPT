@@ -139,23 +139,25 @@ class FusedCrossEntropyLoss(Module):
         probabilities = xp.exp(shifted)
         normalizer = probabilities.sum(axis=-1, keepdims=True)
         value = (xp.log(normalizer[:, 0]) - shifted[rows, targets]).mean()
-        probabilities /= normalizer
         out = Tensor(value, require_grad=inputs.require_grad, pre=(inputs,), opr="fused_cross_entropy")
 
-        def backward():
-            gradient = probabilities.copy()
-            gradient[rows, targets] -= 1
-            gradient *= out.grad / len(targets)
+        if out.require_grad:
+            probabilities /= normalizer
 
-            full_gradient = xp.zeros_like(inputs.data.reshape(-1, inputs.data.shape[-1]))
-            if loss_mask is not None:
-                full_gradient[loss_mask] = gradient
-            else:
-                full_gradient = gradient
+            def backward():
+                gradient = probabilities.copy()
+                gradient[rows, targets] -= 1
+                gradient *= out.grad / len(targets)
 
-            inputs.grad += full_gradient.reshape(inputs.data.shape)
+                if loss_mask is not None:
+                    full_gradient = xp.zeros_like(inputs.data.reshape(-1, inputs.data.shape[-1]))
+                    full_gradient[loss_mask] = gradient
+                else:
+                    full_gradient = gradient
 
-        out._set_backward(backward)
+                inputs.accumulate_grad(full_gradient.reshape(inputs.data.shape))
+
+            out._set_backward(backward)
         return out
 
 class KVCache:
@@ -178,6 +180,19 @@ class KVCache:
         self.data[:, :len(rows), :, :self.length] = self.data[:, rows, :, :self.length]
 
 
+_ROPE_CACHE = {}
+
+def _rope_tables(end, d):
+    cached = _ROPE_CACHE.get(d)
+    if cached is None or cached[0].shape[0] < end:
+        size = max(end, 512 if cached is None else cached[0].shape[0] * 2)
+        freq = 10000.0 ** (-xp.arange(0, d, 2, dtype=xp.float32) / d)
+        angles = xp.arange(size, dtype=xp.float32)[:, None] * freq
+        cos = xp.repeat(xp.cos(angles), 2, axis=-1)
+        sin = (xp.sin(angles)[..., None] * xp.asarray([-1, 1], dtype=xp.float32)).reshape(size, d)
+        _ROPE_CACHE[d] = (cos, sin)
+    return _ROPE_CACHE[d]
+
 class SelfAttention(Module):
     def __init__(self, head_size, head_num, kv_head_num=None):
         super().__init__()
@@ -196,11 +211,9 @@ class SelfAttention(Module):
 
     def rope(self, x, offset=0):
         t, d = x.data.shape[-2:]
-        
-        freq = 10000.0 ** (-xp.arange(0, d, 2, dtype=xp.float32) / d)
-        angles = (xp.arange(t, dtype=xp.float32) + offset)[:, None] * freq
-        cos = xp.repeat(xp.cos(angles), 2, axis=-1)
-        sin = (xp.sin(angles)[..., None] * xp.asarray([-1, 1], dtype=xp.float32)).reshape(t, d)
+        cos_table, sin_table = _rope_tables(offset + t, d)
+        cos = cos_table[offset:offset + t]
+        sin = sin_table[offset:offset + t]
         swapped = x.reshape(*x.data.shape[:-1], d // 2, 2)[..., ::-1].reshape(*x.data.shape)
         return x * Tensor(cos) + swapped * Tensor(sin)
 
@@ -312,16 +325,20 @@ class MoEFeedForward(Module):
 
     def _grouped_experts(self, inputs, projections, ends, max_rows):
         # Each entry gives Triton the original weight and bias pointers and strides.
-        descriptors = []
-        for layer in projections:
-            weight, bias = layer.weight.data, layer.bias.data
-            descriptors.append((
-                weight.data.ptr, 
-                bias.data.ptr,
-                *(stride // weight.itemsize for stride in weight.strides),
-                bias.strides[0] // bias.itemsize
-            ))
-        gate, up, down = xp.asarray(descriptors, dtype=xp.int64).reshape(3, self.num_experts, 5)
+        descriptors = tuple(
+            (
+                layer.weight.data.data.ptr,
+                layer.bias.data.data.ptr,
+                *(stride // layer.weight.data.itemsize for stride in layer.weight.data.strides),
+                layer.bias.data.strides[0] // layer.bias.data.itemsize,
+            )
+            for layer in projections
+        )
+        cached = getattr(self, "_expert_descriptors", None)
+        if cached is None or cached[0] != descriptors:
+            cached = (descriptors, xp.asarray(descriptors, dtype=xp.int64).reshape(3, self.num_experts, 5))
+            self._expert_descriptors = cached
+        gate, up, down = cached[1]
         gate_output = grouped_linear(inputs, gate, ends, max_rows, self.hidden_dim)
         up_output = grouped_linear(inputs, up, ends, max_rows, self.hidden_dim)
         hidden = Tensor(gate_output).silu().data * up_output
@@ -343,7 +360,7 @@ class MoEFeedForward(Module):
 
         flat_experts = top_k_indices.reshape(-1)
         grouped = xp.argsort(flat_experts)
-        counts = (flat_experts[:, None] == xp.arange(self.num_experts)[None, :]).sum(axis=0)
+        counts = xp.bincount(flat_experts, minlength=self.num_experts)
 
         projections = ()
         if (
@@ -388,7 +405,8 @@ class MoEFeedForward(Module):
                 outputs.append(expert(x[token_ids]))
             routed = Tensor.cat(outputs, axis=0)
 
-        inverse = xp.argsort(grouped)
+        inverse = xp.empty_like(grouped)
+        inverse[grouped] = xp.arange(grouped.size, dtype=grouped.dtype)
         routed = routed[inverse].reshape(num_tokens, self.top_k, embedding_dim)
 
         output = (routed * weights).sum(axis=1)

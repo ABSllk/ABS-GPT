@@ -5,7 +5,8 @@ import numpy as np
 from cupyx.profiler import time_range
 
 from core.backend import to_cpu, xp
-from core.nn import CrossEntropyLoss
+from core.nn import FusedCrossEntropyLoss
+from core.optimizer import clip_grad_norm
 from core.tensor import Tensor
 from engine.metrics import synchronize, perplexity
 
@@ -51,7 +52,7 @@ class FixedValidation:
         self.batch_size = batch_size
 
     def evaluate(self, model):
-        loss_fn = CrossEntropyLoss()
+        loss_fn = FusedCrossEntropyLoss()
         total_loss, total_tokens = 0.0, 0
         synchronize()
         start = time.perf_counter()
@@ -102,17 +103,7 @@ class BaseTrainer:
 
     def step_optimizers(self, step):
         with time_range("grad_clip"):
-            total_norm = 0.0
-            for parameter in self.parameters:
-                if parameter.grad is not None:
-                    total_norm += xp.linalg.norm(parameter.grad) ** 2
-            total_norm = xp.sqrt(total_norm)
-            self.last_grad_norm = float(total_norm.item())
-            if self.max_grad_norm is not None and total_norm > self.max_grad_norm:
-                scale = self.max_grad_norm / (total_norm + 1e-6)
-                for parameter in self.parameters:
-                    if parameter.grad is not None:
-                        parameter.grad *= scale
+            self.last_grad_norm = clip_grad_norm(self.parameters, self.max_grad_norm)
         if self.scheduler is not None:
             self.scheduler.step(step)
         for optimizer in self.optimizers:

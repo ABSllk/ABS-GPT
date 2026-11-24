@@ -106,8 +106,6 @@ class TrainingRun:
                     shutil.copyfile(ROOT / path, run / f"{name}.json")
         if args.steps is not None:
             config["planned_steps"] = args.steps
-        if args.compact_optimizer_state:
-            config["optimizer"]["compact_state"] = True
         if args.eval_at and not args.resume:
             config["extra_eval_steps"] = args.eval_at
         config["max_wall_seconds"] = args.max_wall_seconds

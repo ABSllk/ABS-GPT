@@ -4,7 +4,6 @@ from math import inf
 from pathlib import Path
 
 from core.backend import DEVICE, to_cpu, xp
-from core.nn import LogSoftmax
 from core.tensor import Tensor
 from dataset.language_model_loader import render_prompt
 from engine.checkpoint import Checkpoint
@@ -17,9 +16,26 @@ from engine.trainer import BaseTrainer
 
 def token_log_probs(logits, targets):
     batch, length, vocab = logits.data.shape
-    targets = xp.asarray(targets, dtype=xp.int64).reshape(-1)
-    values = LogSoftmax()(logits.reshape(-1, vocab))
-    return values[xp.arange(targets.size), targets].reshape(batch, length)
+    flat_logits = logits.data.reshape(-1, vocab)
+    flat_targets = xp.asarray(targets, dtype=xp.int64).reshape(-1)
+    rows = xp.arange(flat_targets.size)
+    shifted = flat_logits - flat_logits.max(axis=-1, keepdims=True)
+    exps = xp.exp(shifted)
+    normalizer = exps.sum(axis=-1, keepdims=True)
+    values = (shifted[rows, flat_targets] - xp.log(normalizer[:, 0])).reshape(batch, length)
+    out = Tensor(values, require_grad=logits.require_grad, pre=(logits,), opr="token_log_probs")
+
+    if out.require_grad:
+        probs = exps / normalizer
+
+        def _backward():
+            g = out.grad.reshape(-1)
+            grad = -probs * g[:, None]
+            grad[rows, flat_targets] += g
+            logits.accumulate_grad(grad.reshape(batch, length, vocab))
+
+        out._set_backward(_backward)
+    return out
 
 
 def model_log_probs(model, batch, rows=slice(None)):
@@ -202,18 +218,23 @@ class RolloutTrainer(PostTrainingTrainer):
 
     def collect_rollouts(self, rows, seed):
         generator = Generator(self.model, self.context_size, seed=seed)
-        rollouts = []
+        expanded = []
         for row in rows:
             prefix = [self.tokenizer.bos_id, *self.tokenizer.encode(render_prompt(row["prompt"]))]
-            for _ in range(self.group_size):
-                result = generator.generate(prefix, self.tokenizer.eos_id, max_new_tokens=self.max_new_tokens)
-                tokens = result["token_ids"]
-                rollouts.append({
-                    **row, "prompt_ids": prefix, "completion_ids": tokens,
-                    "completion": self.tokenizer.decode(tokens, errors="replace"),
-                    "finish_reason": result["finish_reason"],
-                })
-        return rollouts
+            expanded.extend((row, prefix) for _ in range(self.group_size))
+        results = generator.generate_batch(
+            [prefix for _, prefix in expanded],
+            self.tokenizer.eos_id,
+            max_new_tokens=self.max_new_tokens,
+        )
+        return [
+            {
+                **row, "prompt_ids": prefix, "completion_ids": result["token_ids"],
+                "completion": self.tokenizer.decode(result["token_ids"], errors="replace"),
+                "finish_reason": result["finish_reason"],
+            }
+            for (row, prefix), result in zip(expanded, results, strict=True)
+        ]
 
     def log_probs(self, batch, model=None):
         model = self.model if model is None else model

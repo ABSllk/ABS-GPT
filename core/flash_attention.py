@@ -116,8 +116,7 @@ def tiled_attention(Q, K, V, past_len=0, block_size=32):
     def _backward():
         dq, dk, dv = fused_backward(q, k, v, output, lse, out.grad, past_len)
         for tensor, grad in ((Q, dq), (K, dk), (V, dv)):
-            if tensor.require_grad:
-                tensor.grad += grad
+            tensor.accumulate_grad(grad)
 
     out._set_backward(_backward)
     return out

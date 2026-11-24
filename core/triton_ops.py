@@ -1,4 +1,6 @@
 import cupy as cp
+from cupy.cuda import cublas, device as cuda_device, runtime as cuda_runtime
+import numpy as np
 import triton
 import triton.language as tl
 
@@ -14,8 +16,8 @@ class Pointer:
         return self.array.data.ptr
 
 @triton.jit
-def _softmax(X, Y, ROWS: tl.constexpr, COLS: tl.constexpr,
-             XR: tl.constexpr, XC: tl.constexpr, BLOCK: tl.constexpr):
+def _softmax(X, Y, ROWS, COLS,
+             XR, XC, BLOCK: tl.constexpr):
     cols = tl.arange(0, BLOCK)
     for row in range(tl.program_id(0), ROWS, tl.num_programs(0)):
         x = tl.load(X + row * XR + cols * XC, cols < COLS, other=-float("inf")).to(tl.float32)
@@ -23,7 +25,7 @@ def _softmax(X, Y, ROWS: tl.constexpr, COLS: tl.constexpr,
         tl.store(Y + row * COLS + cols, exp / tl.sum(exp, axis=0), cols < COLS)
 
 @triton.jit
-def _softmax_backward(Y, G, DX, COLS: tl.constexpr, GR: tl.constexpr, GC: tl.constexpr,
+def _softmax_backward(Y, G, DX, COLS, GR, GC,
                       BLOCK: tl.constexpr):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
@@ -33,8 +35,8 @@ def _softmax_backward(Y, G, DX, COLS: tl.constexpr, GR: tl.constexpr, GC: tl.con
     tl.store(DX + row * COLS + cols, dx, cols < COLS)
 
 @triton.jit
-def _matmul(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-            AM: tl.constexpr, AK: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr,
+def _matmul(A, B, C, M, N, K,
+            AM, AK, BK, BN,
             BM: tl.constexpr, BNC: tl.constexpr, BKC: tl.constexpr,
             PRECISION: tl.constexpr):
     pid = tl.program_id(0)
@@ -122,6 +124,90 @@ def grouped_linear(x, params, ends, max_rows, out_dim):
     _grouped_linear[grid](Pointer(x), Pointer(params), Pointer(ends), Pointer(out), x.shape[1], out_dim, 16, 64, 32)
     return out
 
+@triton.jit
+def _multi_tensor_norm_sq(PTRS, SIZES, OUT, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    ptr = tl.load(PTRS + pid).to(tl.pointer_type(tl.float32))
+    size = tl.load(SIZES + pid)
+    acc = tl.zeros((BLOCK,), tl.float32)
+    for start in range(0, size, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        x = tl.load(ptr + offs, offs < size, other=0.0)
+        acc += x * x
+    tl.store(OUT + pid, tl.sum(acc, axis=0))
+
+@triton.jit
+def _multi_tensor_scale(PTRS, SIZES, SCALE, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    ptr = tl.load(PTRS + pid).to(tl.pointer_type(tl.float32))
+    size = tl.load(SIZES + pid)
+    for start in range(0, size, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < size
+        x = tl.load(ptr + offs, mask, other=0.0)
+        tl.store(ptr + offs, x * SCALE, mask)
+
+def multi_tensor_norm_sq(ptrs, sizes):
+    out = cp.empty(sizes.size, dtype=cp.float32)
+    _multi_tensor_norm_sq[(sizes.size,)](Pointer(ptrs), Pointer(sizes), Pointer(out), 1024, num_warps=4)
+    return out
+
+def multi_tensor_scale(ptrs, sizes, scale):
+    _multi_tensor_scale[(sizes.size,)](Pointer(ptrs), Pointer(sizes), float(scale), 1024, num_warps=4)
+
+_NS_ONE = np.array(1.0, dtype=np.float32)
+_NS_ZERO = np.array(0.0, dtype=np.float32)
+_NS_A = np.array(3.4445, dtype=np.float32)
+_NS_B = np.array(-4.7750, dtype=np.float32)
+_NS_C = np.array(2.0315, dtype=np.float32)
+
+def _bgemm_fp16(handle, op_a, op_b, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc):
+    cublas.gemmStridedBatchedEx(
+        handle, op_a, op_b, m, n, k, alpha.ctypes.data,
+        a.data.ptr, cuda_runtime.CUDA_R_16F, lda, a.shape[1] * a.shape[2],
+        b.data.ptr, cuda_runtime.CUDA_R_16F, ldb, b.shape[1] * b.shape[2],
+        beta.ctypes.data,
+        c.data.ptr, cuda_runtime.CUDA_R_16F, ldc, c.shape[1] * c.shape[2],
+        c.shape[0], cublas.CUBLAS_COMPUTE_32F, cublas.CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+    )
+
+def newton_schulz_batched(X, steps=5):
+    Xh = cp.ascontiguousarray(X, dtype=cp.float16)
+    handle = cuda_device.get_cublas_handle()
+    batch, m, k = Xh.shape
+    A = cp.empty((batch, m, m), dtype=cp.float16)
+    B = cp.empty((batch, m, m), dtype=cp.float16)
+    out = cp.empty_like(Xh)
+    for _ in range(steps):
+        _bgemm_fp16(handle, cublas.CUBLAS_OP_T, cublas.CUBLAS_OP_N, m, m, k, _NS_ONE, Xh, k, Xh, k, _NS_ZERO, A, m)
+        cp.copyto(B, A)
+        _bgemm_fp16(handle, cublas.CUBLAS_OP_N, cublas.CUBLAS_OP_N, m, m, m, _NS_C, A, m, A, m, _NS_B, B, m)
+        cp.copyto(out, Xh)
+        _bgemm_fp16(handle, cublas.CUBLAS_OP_N, cublas.CUBLAS_OP_N, k, m, m, _NS_ONE, Xh, k, B, m, _NS_A, out, k)
+        Xh, out = out, Xh
+    return Xh.astype(cp.float32)
+
+adamw_step = cp.ElementwiseKernel(
+    "T g, float32 lr, float32 beta1, float32 beta2, float32 bc1, float32 bc2, float32 eps, float32 wd",
+    "T p, T m, T v",
+    """
+    m = beta1 * m + (1.0f - beta1) * g;
+    v = beta2 * v + (1.0f - beta2) * g * g;
+    p -= lr * ((m / bc1) / (sqrt(v / bc2) + eps) + wd * p);
+    """,
+    "adamw_step",
+)
+
+muon_update = cp.ElementwiseKernel(
+    "T u, T b, float32 decay, float32 step_scale",
+    "T p, T buf",
+    """
+    buf = b;
+    p = p * decay - step_scale * u;
+    """,
+    "muon_update",
+)
+
 def softmax_tensor(x):
     y = softmax(x.data)
     out = Tensor(y, require_grad=x.require_grad, pre=(x,), opr="triton_softmax")
@@ -133,7 +219,7 @@ def softmax_tensor(x):
         _softmax_backward[(rows,)](Pointer(y), Pointer(g), Pointer(dx), cols,
             *(s // g.itemsize for s in g.strides), triton.next_power_of_2(cols),
             num_warps=4 if cols <= 2048 else 8)
-        x.grad += dx
+        x.accumulate_grad(dx)
 
     out._set_backward(backward)
     return out
@@ -144,9 +230,9 @@ def matmul_tensor(a, b, precision="ieee"):
 
     def backward():
         if a.require_grad:
-            a.grad += matmul(out.grad, cp.ascontiguousarray(b.data.T), precision)
+            a.accumulate_grad(matmul(out.grad, cp.ascontiguousarray(b.data.T), precision))
         if b.require_grad:
-            b.grad += matmul(a.data.T, out.grad, precision)
+            b.accumulate_grad(matmul(a.data.T, out.grad, precision))
 
     out._set_backward(backward)
     return out

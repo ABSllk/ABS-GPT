@@ -10,14 +10,14 @@ from core.triton_ops import Pointer
 def _forward(
     Q, K, V, O, LSE, SEG,
     HQ: tl.constexpr, HKV: tl.constexpr,
-    TQ: tl.constexpr, TK: tl.constexpr,
-    D: tl.constexpr, PAST: tl.constexpr,
-    QB: tl.constexpr, QH: tl.constexpr,
-    QT: tl.constexpr, QD: tl.constexpr,
-    KB: tl.constexpr, KH: tl.constexpr,
-    KT: tl.constexpr, KD: tl.constexpr,
-    VB: tl.constexpr, VH: tl.constexpr,
-    VT: tl.constexpr, VD: tl.constexpr,
+    TQ, TK,
+    D: tl.constexpr, PAST,
+    QB, QH,
+    QT, QD,
+    KB, KH,
+    KT, KD,
+    VB, VH,
+    VT, VD,
     BD: tl.constexpr, BLOCK: tl.constexpr,
     PRECISION: tl.constexpr,
     HAS_SEGMENTS: tl.constexpr,
@@ -65,7 +65,7 @@ def _forward(
     tl.store(LSE + row_base, tl.where(ell > 0, m + tl.log(demoninator), 0.0), rows < TQ)
 
 @triton.jit
-def _delta(O, G, DELTA, ROWS: tl.constexpr, D: tl.constexpr, BD: tl.constexpr):
+def _delta(O, G, DELTA, ROWS, D: tl.constexpr, BD: tl.constexpr):
     rows = tl.program_id(0) * 32 + tl.arange(0, 32)
     features = tl.arange(0, BD)
     mask = (rows[:, None] < ROWS) & (features[None, :] < D)
@@ -78,14 +78,14 @@ def _delta(O, G, DELTA, ROWS: tl.constexpr, D: tl.constexpr, BD: tl.constexpr):
 def _backward(
     Q, K, V, G, LSE, DELTA, DQ, DK, DV, SEG,
     HQ: tl.constexpr, HKV: tl.constexpr,
-    TQ: tl.constexpr, TK: tl.constexpr,
-    D: tl.constexpr, PAST: tl.constexpr,
-    QB: tl.constexpr, QH: tl.constexpr,
-    QT: tl.constexpr, QD: tl.constexpr,
-    KB: tl.constexpr, KH: tl.constexpr,
-    KT: tl.constexpr, KD: tl.constexpr,
-    VB: tl.constexpr, VH: tl.constexpr,
-    VT: tl.constexpr, VD: tl.constexpr,
+    TQ, TK,
+    D: tl.constexpr, PAST,
+    QB, QH,
+    QT, QD,
+    KB, KH,
+    KT, KD,
+    VB, VH,
+    VT, VD,
     BD: tl.constexpr, BLOCK: tl.constexpr,
     COMPUTE_DQ: tl.constexpr, PRECISION: tl.constexpr,
     HAS_SEGMENTS: tl.constexpr,
@@ -214,8 +214,7 @@ def tiled_attention(Q, K, V, past_len=0, precision="ieee", segment_ids=None):
     def backward():
         grads = fused_backward(Q.data, K.data, V.data, output, lse, out.grad, past_len, precision, segments)
         for tensor, grad in zip((Q, K, V), grads):
-            if tensor.require_grad:
-                tensor.grad += grad
+            tensor.accumulate_grad(grad)
 
     out._set_backward(backward)
     return out
@@ -229,7 +228,7 @@ def _prepare_segments(segment_ids, q, k, past_len):
 @triton.jit
 def _attention_valid(
     SEG, batch, rows, keys, 
-    TQ: tl.constexpr, TK: tl.constexpr, PAST: tl.constexpr, HAS_SEGMENTS: tl.constexpr
+    TQ, TK, PAST, HAS_SEGMENTS: tl.constexpr
 ):
     valid = (rows[:, None] < TQ) & (keys[None, :] < TK) & (keys[None, :] <= PAST + rows[:, None])
     if HAS_SEGMENTS:

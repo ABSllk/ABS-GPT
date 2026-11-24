@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from core.backend import xp
-from core.nn import CrossEntropyLoss
+from core.nn import FusedCrossEntropyLoss
 from core.optimizer import Optimizer
 from dataset.language_model_loader import LanguageModelLoader
 from engine.run import ROOT, TrainingRun, parse_config
@@ -47,7 +47,6 @@ def parse_args(argv=None):
     parser.add_argument("--packing", dest="settings.packing", type=str)
     parser.add_argument("--micro-batch-size", dest="settings.micro_batch_size", type=int)
     parser.add_argument("--release-cuda-cache", dest="settings.release_cuda_cache", action="store_true")
-    parser.add_argument("--compact-optimizer-state", action="store_true", default=False)
     parser.add_argument("--optimizer", dest="settings.optimizer_name", type=str)
     parser.add_argument("--lr", dest="settings.optimizer.lr", type=float)
     parser.add_argument("--muon-lr", dest="settings.muon_optimizer.lr", type=float)
@@ -108,7 +107,7 @@ def main(validation_callback=None, argv=None):
     trainer = LanguageModelTrainer(
         model, 
         optimizers, 
-        CrossEntropyLoss(), 
+        FusedCrossEntropyLoss(), 
         manifest["max_grad_norm"], 
         micro_batch_size=manifest.get("micro_batch_size"), 
         scheduler=run.scheduler(optimizers, args),

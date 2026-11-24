@@ -1,5 +1,34 @@
-from core.backend import xp
+from collections import defaultdict
+from core.backend import DEVICE, xp
 import json
+
+if DEVICE == "cuda":
+    from core.triton_ops import (
+        adamw_step,
+        multi_tensor_norm_sq,
+        multi_tensor_scale,
+        muon_update,
+        newton_schulz_batched,
+    )
+
+
+def clip_grad_norm(parameters, max_norm):
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return 0.0
+    if DEVICE == "cuda" and all(g.dtype == xp.float32 and g.flags.c_contiguous for g in grads):
+        ptrs = xp.asarray([g.data.ptr for g in grads], dtype=xp.int64)
+        sizes = xp.asarray([g.size for g in grads], dtype=xp.int32)
+        total_norm = float(xp.sqrt(multi_tensor_norm_sq(ptrs, sizes).sum()).item())
+        if max_norm is not None and total_norm > max_norm:
+            multi_tensor_scale(ptrs, sizes, max_norm / (total_norm + 1e-6))
+        return total_norm
+    total_norm = float(xp.sqrt(sum((g * g).sum() for g in grads)).item())
+    if max_norm is not None and total_norm > max_norm:
+        scale = max_norm / (total_norm + 1e-6)
+        for g in grads:
+            g *= scale
+    return total_norm
 
 class Optimizer:
     @staticmethod
@@ -29,25 +58,18 @@ class Optimizer:
         ]
 
     def step(self):
-        for p in self.parameters:
-            p.data -= self.lr * p.grad
+        for group in self.param_groups:
+            lr = group["lr"]
+            for p in group["params"]:
+                if p.grad is not None:
+                    p.data -= lr * p.grad
 
     def zero_grad(self):
         for p in self.parameters:
             p.zero_grad()
 
     def clip_grad_norm(self, max_norm):
-        total_norm = 0.0
-        for p in self.parameters:
-            param_norm = xp.linalg.norm(p.grad)
-            total_norm += param_norm ** 2
-        total_norm = xp.sqrt(total_norm)
-
-        if total_norm > max_norm:
-            scale_factor = max_norm / (total_norm + 1e-6)
-            for p in self.parameters:
-                p.grad *= scale_factor
-        return float(total_norm.item())
+        return clip_grad_norm(self.parameters, max_norm)
 
     def state_dict(self, copy=True):
         ids = {p: i for i, p in enumerate(self.parameters)}
@@ -136,16 +158,17 @@ class AdamW(Optimizer):
                 state["step"] += 1
                 step = state["step"]
                 m, v = state["m"], state["v"]
+                bc1 = 1 - beta1 ** step
+                bc2 = 1 - beta2 ** step
 
-                m *= beta1
-                m += (1 - beta1) * p.grad
-                v *= beta2
-                v += (1 - beta2) * (p.grad ** 2)
-
-                m_hat = m / (1 - beta1 ** step)
-                v_hat = v / (1 - beta2 ** step)
-
-                p.data -= lr * (m_hat / (xp.sqrt(v_hat) + eps) + weight_decay * p.data)
+                if DEVICE == "cuda":
+                    adamw_step(p.grad, lr, beta1, beta2, bc1, bc2, eps, weight_decay, p.data, m, v)
+                else:
+                    m *= beta1
+                    m += (1 - beta1) * p.grad
+                    v *= beta2
+                    v += (1 - beta2) * (p.grad ** 2)
+                    p.data -= lr * ((m / bc1) / (xp.sqrt(v / bc2) + eps) + weight_decay * p.data)
 
 class Muon(Optimizer):
     def __init__(self, parameters, lr=0.001, momentum=0.95, weight_decay=0.01): # 此处momentum是系数，而非动量本身
@@ -153,17 +176,24 @@ class Muon(Optimizer):
 
     def ortholaize(self, update, steps=5):
         X = update.astype(xp.float32, copy=True)
-        X /= xp.linalg.norm(X) + 1e-6
-        transpose = X.shape[0] > X.shape[1]
+        norms = xp.sqrt((X * X).sum(axis=(-2, -1), keepdims=True))
+        X /= norms + 1e-6
+        transpose = X.shape[-2] > X.shape[-1]
 
         if transpose:
-            X = X.T
-        for _ in range(steps):
-            A = X @ X.T
-            B = -4.7750 * A + (2.0315 * A) @ A
-            X = 3.4445 * X + B @ X
+            X = xp.swapaxes(X, -1, -2)
+        if DEVICE == "cuda":
+            was_2d = X.ndim == 2
+            X = newton_schulz_batched(X[None] if was_2d else X, steps)
+            if was_2d:
+                X = X[0]
+        else:
+            for _ in range(steps):
+                A = X @ xp.swapaxes(X, -1, -2)
+                B = -4.7750 * A + (2.0315 * A) @ A
+                X = 3.4445 * X + B @ X
         if transpose:
-            X = X.T
+            X = xp.swapaxes(X, -1, -2)
         return X
 
     def step(self):
@@ -171,24 +201,30 @@ class Muon(Optimizer):
             lr = group["lr"]
             momentum = group["momentum"]
             weight_decay = group["weight_decay"]
+            decay = 1 - lr * weight_decay
 
+            buckets = defaultdict(list)
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                
                 if p not in self.state:
-                    self.state[p] = {
-                        "buffer": xp.zeros_like(p.data),
-                    }
-                buffer = self.state[p]["buffer"]
+                    self.state[p] = {"buffer": xp.zeros_like(p.data)}
+                buckets[p.data.shape].append(p)
 
-                buffer *= momentum
-                buffer += (1 - momentum) * p.grad
-                update = (1 - momentum) * p.grad + momentum * buffer
-                update = self.ortholaize(update)
+            for (in_feature, out_feature), bucket in buckets.items():
+                grads = xp.stack([p.grad for p in bucket])
+                buffers = xp.stack([self.state[p]["buffer"] for p in bucket])
+                grad_term = (1 - momentum) * grads
+                buffers *= momentum
+                buffers += grad_term
+                updates = self.ortholaize(grad_term + momentum * buffers)
+                step_scale = lr * (max(1.0, out_feature / in_feature) ** 0.5)
 
-                in_feature, out_feature = p.data.shape
-                scale = max(1.0, out_feature / in_feature) ** 0.5
-
-                p.data *= 1- lr * weight_decay
-                p.data -= lr * scale * update
+                for i, p in enumerate(bucket):
+                    buf = self.state[p]["buffer"]
+                    if DEVICE == "cuda":
+                        muon_update(updates[i], buffers[i], decay, step_scale, p.data, buf)
+                    else:
+                        buf[...] = buffers[i]
+                        p.data *= decay
+                        p.data -= step_scale * updates[i]
